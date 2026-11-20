@@ -146,6 +146,17 @@ impl Shared {
     }
 }
 
+/// Returns whether reading the peer credentials failed because the daemon
+/// already closed the connection (macOS reports `EINVAL` then).
+fn peer_is_gone(err: &anyhow::Error) -> bool {
+    protocol::is_disconnect(err)
+        || err.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.raw_os_error() == Some(libc::EINVAL))
+        })
+}
+
 /// Sends SIGCHLD to the current process so pty event loops check whether
 /// their child exited.
 fn raise_sigchld() {
@@ -259,9 +270,22 @@ impl DaemonClient {
             }
             Err(err) => return Err(err).context("Failed to connect to terminal daemon"),
         };
-        check_peer_uid(stream.as_raw_fd(), nix::unistd::geteuid().as_raw())
-            .context("Refusing to talk to a terminal daemon owned by another user")?;
-        stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+        match check_peer_uid(stream.as_raw_fd(), nix::unistd::geteuid().as_raw()) {
+            Ok(()) => {}
+            Err(err) if peer_is_gone(&err) => return Ok(None),
+            Err(err) => {
+                return Err(
+                    err.context("Refusing to talk to a terminal daemon owned by another user")
+                );
+            }
+        }
+        if let Err(err) = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT)) {
+            let err = anyhow::Error::new(err);
+            if peer_is_gone(&err) {
+                return Ok(None);
+            }
+            return Err(err.context("Failed to configure the terminal daemon socket"));
+        }
         let hello = protocol::send_frame(
             stream.as_raw_fd(),
             &ClientMessage::Hello {
@@ -290,7 +314,13 @@ impl DaemonClient {
             Err(err) if protocol::is_disconnect(&err) => return Ok(None),
             Err(err) => return Err(err.context("Terminal daemon handshake failed")),
         };
-        stream.set_read_timeout(None)?;
+        if let Err(err) = stream.set_read_timeout(None) {
+            let err = anyhow::Error::new(err);
+            if peer_is_gone(&err) {
+                return Ok(None);
+            }
+            return Err(err.context("Failed to configure the terminal daemon socket"));
+        }
 
         let shared = Arc::new(Shared {
             socket: OwnedFd::from(stream),
