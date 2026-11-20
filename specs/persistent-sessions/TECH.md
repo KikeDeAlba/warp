@@ -208,3 +208,27 @@ Side B: event loop with a mock `EventedPty` whose replay contains `ESC[c` leaves
 
 ## Consequences
 Sessions survive quitting and app crashes. One resident process per user, exiting after 60 s idle. Closing a pane still kills its process. Persistence requires session restoration. A new protocol version does not reattach sessions from the previous one.
+
+## Manual verification
+Automated daemon checks against the real binary (headless, isolated `HOME`):
+`cargo build --bin warp-oss --features gui && WARP_DAEMON_E2E_BIN=$PWD/target/debug/warp-oss cargo test -p warp_terminal daemon_e2e -- --test-threads=1`.
+
+GUI checklist (build and run `warp-oss`; settings live at Settings > Features, "Keep sessions running after quitting Warp"). Use `pgrep -fl 'terminal-server --daemon'` and `ps -o pid,ppid,command -p <shell pid>` to observe processes.
+
+Setting on (default, "Restore windows, tabs, and panes on startup" on):
+1. Start `i=0; while true; do echo $i; i=$((i+1)); sleep 0.5; done` in a tab, quit with Cmd+Q and accept the quit warning, which should say commands keep running in the background. The shell and one `terminal-server --daemon` (ppid 1) stay alive.
+2. Relaunch: the tab is restored with the same shell pid, the counter output continues without a gap, the prompt and block history are intact, and typing works.
+3. Run `vim` or `top` and quit/relaunch: the TUI redraws at the right size; resize the window and confirm it follows.
+4. Force-quit the app (`kill -9` the GUI process): relaunch and confirm the shells are still there.
+5. Close a tab or pane (not quit): its process ends (`ps` shows it gone) and it is not restored.
+6. Open several windows, quit, relaunch: each pane reattaches to its own shell.
+7. Produce about 100 MB of output (`head -c 100000000 /dev/zero | tr '\0' y`) and quit mid-way: the command finishes in the background and the relaunch shows its tail without freezing.
+8. Quit and leave Warp closed with no shells running: the daemon exits after about 60 s (`pgrep` is empty).
+
+Toggle scenarios:
+9. On to off with a daemon tab open: the tab keeps working; open a new tab (legacy shell, no new daemon session); quit: every shell, including the daemon one, is killed and nothing survives (`pgrep`, `ps`).
+10. Off to on: only new tabs persist; old legacy tabs die on quit; no restart needed.
+11. With the setting off at launch while a daemon from an earlier run still holds sessions: after restore the stale sessions are pruned (their shells die) and the app uses fresh shells.
+12. Turn off "Restore windows, tabs, and panes on startup": the persistence toggle renders disabled and behaves as off.
+13. Launch with `APPIMAGE` set (Linux): the feature is disabled and quitting kills shells.
+14. Delete or rename the daemon socket while Warp runs and open a new tab: one error is reported and the tab falls back to a normal shell.
