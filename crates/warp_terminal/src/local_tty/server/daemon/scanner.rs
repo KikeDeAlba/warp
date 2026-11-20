@@ -2,8 +2,12 @@
 
 use serde::Deserialize;
 
-/// Hook payloads larger than this are ignored.
-pub(super) const MAX_HOOK_PAYLOAD: usize = 1024 * 1024;
+/// Hook payloads larger than this are ignored. The largest hook,
+/// `Bootstrapped`, carries the shell's aliases, function names, builtins,
+/// options and exported variable names; a typical zsh setup sends about 16 KiB
+/// of JSON (32 KiB hex-encoded) and heavy plugin setups a few hundred KiB, so
+/// this leaves a wide margin.
+pub(super) const MAX_HOOK_PAYLOAD: usize = 8 * 1024 * 1024;
 
 const ESC: u8 = 0x1b;
 const CAN: u8 = 0x18;
@@ -114,6 +118,10 @@ impl DcsScanner {
                 CAN | SUB => self.abort(),
                 _ => {
                     if self.payload.len() >= MAX_HOOK_PAYLOAD {
+                        log::warn!(
+                            "Dropping a shell hook larger than {MAX_HOOK_PAYLOAD} bytes; \
+                             it will not be part of a replay"
+                        );
                         self.payload = Vec::new();
                         self.state = State::Ignore;
                     } else {
