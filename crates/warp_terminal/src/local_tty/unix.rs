@@ -658,10 +658,14 @@ impl Pty {
         ctx: &mut AppContext,
     ) -> Result<Self> {
         let size = options.size;
+        // Prepare signal handling first: the daemon client raises SIGCHLD as
+        // soon as it learns the session exited.
+        let signals = Signals::new([signal_hook::consts::SIGCHLD])
+            .context("error preparing signal handling")?;
         let session = PtySpawner::handle(ctx).update(ctx, |pty_spawner, _| {
             pty_spawner.spawn_persistent_session(session_id, metadata, options, hooks)
         })?;
-        Self::from_attached(session, &size)
+        Ok(Self::from_attached_with_signals(session, &size, signals))
     }
 
     /// Reattaches to a session that kept running in the daemon, if there is one
@@ -671,28 +675,42 @@ impl Pty {
         size: &SizeInfo,
         ctx: &mut AppContext,
     ) -> Option<Self> {
+        // Prepare signal handling first: attaching to an exited session raises
+        // SIGCHLD right away.
+        let signals = match Signals::new([signal_hook::consts::SIGCHLD]) {
+            Ok(signals) => signals,
+            Err(err) => {
+                report_error!(
+                    anyhow::Error::from(err)
+                        .context("Failed to prepare signal handling for persistent session")
+                );
+                return None;
+            }
+        };
         let session = PtySpawner::handle(ctx).update(ctx, |pty_spawner, _| {
             pty_spawner.attach_persistent_session(session_id)
         })?;
-        match Self::from_attached(session, size) {
-            Ok(pty) => Some(pty),
-            Err(err) => {
-                report_error!(err.context("Failed to set up reattached persistent session"));
-                None
-            }
-        }
+        Some(Self::from_attached_with_signals(session, size, signals))
     }
 
     /// Wraps a session handed over by the daemon.
     pub fn from_attached(session: AttachedSession, size: &SizeInfo) -> Result<Self> {
+        let signals = Signals::new([signal_hook::consts::SIGCHLD])
+            .context("error preparing signal handling")?;
+        Ok(Self::from_attached_with_signals(session, size, signals))
+    }
+
+    fn from_attached_with_signals(
+        session: AttachedSession,
+        size: &SizeInfo,
+        signals: Signals,
+    ) -> Self {
         let AttachedSession {
             info,
             data,
             leader,
             handle,
         } = session;
-        let signals = Signals::new([signal_hook::consts::SIGCHLD])
-            .context("error preparing signal handling")?;
         let fd = File::from(data);
         unsafe { set_nonblocking(fd.as_raw_fd()) };
         let pending_replay = (info.replay_len > 0).then_some(info.replay_len);
@@ -714,7 +732,7 @@ impl Pty {
             pty.on_resize(&narrower);
         }
         pty.on_resize(size);
-        Ok(pty)
+        pty
     }
 
     pub fn get_pid(&self) -> u32 {
