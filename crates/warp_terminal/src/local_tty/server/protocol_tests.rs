@@ -41,7 +41,6 @@ fn client_messages() -> Vec<ClientMessage> {
             options: Box::new(sh_options("true")),
             environment: Some(SpawnEnvironment {
                 vars: vec![("EXAMPLE_VAR".into(), "example-value".into())],
-                cwd: Some("/tmp/example".into()),
             }),
         },
         DaemonRequest::Attach {

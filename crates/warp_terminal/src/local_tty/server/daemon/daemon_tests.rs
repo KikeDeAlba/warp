@@ -632,10 +632,7 @@ fn shell_starts_from_the_client_environment() {
             session_id(20),
             metadata(),
             sh_options(&script),
-            SpawnEnvironment {
-                vars,
-                cwd: std::env::current_dir().ok().map(|cwd| cwd.into_os_string()),
-            },
+            SpawnEnvironment { vars },
         )
         .unwrap();
     let mut data = stream(spawned.data.try_clone().unwrap());

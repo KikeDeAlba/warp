@@ -154,7 +154,6 @@ fn oversized_request_fails_without_dropping_the_connection() {
             "EXAMPLE_HUGE".into(),
             "x".repeat(protocol::MAX_CLIENT_FRAME_SIZE).into(),
         )],
-        cwd: None,
     };
     let err = client
         .spawn_with_environment(

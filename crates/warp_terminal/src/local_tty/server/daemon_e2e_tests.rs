@@ -617,7 +617,6 @@ fn daemon_e2e_shell_gets_the_client_environment_and_limits() {
             ("HOME".into(), env.home.clone().into_os_string()),
             ("EXAMPLE_CLIENT_VAR".into(), "from-client".into()),
         ],
-        cwd: Some("/".into()),
     };
     let session = client
         .spawn_with_environment(session_id(30), metadata(), sh_options(script), environment)

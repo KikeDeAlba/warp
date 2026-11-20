@@ -17,11 +17,12 @@ use super::api::{
     AttachInfo, ClientMessage, DAEMON_PROTOCOL_VERSION, DaemonEvent, DaemonMessage, DaemonRequest,
     DaemonResponse, PersistentSessionId, SessionMetadata, SessionSummary, SpawnEnvironment,
 };
-use super::daemon::{DaemonPaths, check_peer_uid, max_fd_to_close};
+use super::daemon::{DaemonPaths, check_peer_uid};
 use super::protocol;
 use crate::event::ObservedExitStatus;
 use crate::local_tty::PtyOptions;
 use crate::local_tty::spawner::PtyHandle;
+use crate::local_tty::unix::close_fds_upper_bound;
 
 const SPAWN_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(3);
@@ -477,7 +478,7 @@ fn spawn_daemon_command(program: &PathBuf) -> Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let fd_limit = max_fd_to_close();
+    let fd_limit = close_fds_upper_bound();
     // SAFETY: the closure only calls async-signal-safe functions.
     unsafe {
         command.pre_exec(move || {

@@ -1,5 +1,4 @@
 use std::ffi::OsString;
-use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -64,7 +63,7 @@ pub(super) enum Message {
     },
 }
 
-pub const DAEMON_PROTOCOL_VERSION: u32 = 1;
+pub const DAEMON_PROTOCOL_VERSION: u32 = 2;
 pub const RING_CAPACITY: usize = 10 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -88,23 +87,20 @@ pub struct SessionMetadata {
     pub shell_type: String,
 }
 
-/// The process context of the client at spawn time. The daemon spawns the
-/// shell with exactly these variables as its base environment, as if the
-/// client had spawned it, instead of the environment the daemon started with.
+/// The environment of the client at spawn time. The daemon passes these
+/// variables as the shell's base environment (`PtyOptions::base_env`), so the
+/// shell starts as if the client had spawned it instead of inheriting the
+/// environment the daemon started with.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpawnEnvironment {
     pub vars: Vec<(OsString, OsString)>,
-    /// An `OsString` rather than a `PathBuf` so non-UTF-8 paths survive
-    /// serialization.
-    pub cwd: Option<OsString>,
 }
 
 impl SpawnEnvironment {
-    /// Captures the current process environment and working directory.
+    /// Captures the current process environment.
     pub fn capture() -> Self {
         Self {
             vars: std::env::vars_os().collect(),
-            cwd: std::env::current_dir().ok().map(PathBuf::into_os_string),
         }
     }
 }

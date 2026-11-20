@@ -29,8 +29,7 @@ use signal_hook_mio::v1_0::Signals;
 
 pub(crate) use self::listener::{DaemonPaths, check_peer_uid};
 use self::listener::{InstanceLock, bind_socket, peer_uid};
-pub(crate) use self::process::max_fd_to_close;
-use self::process::{InheritedLimits, harden_daemon_process, with_spawn_context};
+use self::process::harden_daemon_process;
 use self::session::{Attachment, PumpOutcome, Session, observed_exit_status};
 use super::api::{
     AttachInfo, ClientMessage, DAEMON_PROTOCOL_VERSION, DaemonEvent, DaemonMessage, DaemonRequest,
@@ -39,7 +38,7 @@ use super::api::{
 use super::protocol::{
     self, FillResult, FlushResult, FrameReader, FrameWriter, MAX_CLIENT_FRAME_SIZE,
 };
-use crate::local_tty::{self, PtyOptions};
+use crate::local_tty::{self, ChildResourceLimits, PtyOptions};
 
 /// Overrides the idle timeout, in seconds.
 pub(crate) const IDLE_TIMEOUT_ENV: &str = "WARP_TERMINAL_DAEMON_IDLE_SECS";
@@ -75,7 +74,7 @@ pub(crate) struct DaemonConfig {
     pub hello_timeout: Duration,
     pub max_connections: usize,
     /// The limits restored for spawned shells; `None` leaves them unchanged.
-    pub inherited_limits: Option<InheritedLimits>,
+    pub inherited_limits: Option<ChildResourceLimits>,
     /// The log file that stdout and stderr point to, rotated by size.
     pub log_file: Option<PathBuf>,
 }
@@ -795,19 +794,13 @@ impl Daemon {
             self.kill_session(id);
         }
         options.close_fds = true;
-        let limits = self.config.inherited_limits;
-        let spawn = |limits| {
+        options.child_rlimits = self.config.inherited_limits;
+        if let Some(environment) = environment {
+            options.base_env = Some(environment.vars);
+        }
+        let info = {
             let _guard = fork_guard();
-            with_spawn_context(environment.as_ref(), limits, || {
-                local_tty::spawn(options.clone())
-            })
-        };
-        let info = match spawn(limits) {
-            Err(err) if limits.is_some() => {
-                log::warn!("Spawn with the inherited limits failed ({err:#}); retrying");
-                spawn(None)?
-            }
-            result => result?,
+            local_tty::spawn(options)?
         };
         // SAFETY: the spawn result transfers ownership of the leader fd.
         let leader = unsafe { OwnedFd::from_raw_fd(info.result.leader_fd) };
