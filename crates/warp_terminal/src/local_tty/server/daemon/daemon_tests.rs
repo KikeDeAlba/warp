@@ -98,6 +98,12 @@ fn bootstrapped_hook() -> Vec<u8> {
     ))
 }
 
+fn command_finished_hook() -> Vec<u8> {
+    hex_hook(&format!(
+        r#"{{"hook":"CommandFinished","value":{{"exit_code":0,"session_id":{HOOK_SESSION}}}}}"#
+    ))
+}
+
 fn precmd_hook() -> Vec<u8> {
     hex_hook(&format!(
         r#"{{"hook":"Precmd","value":{{"session_id":{HOOK_SESSION}}}}}"#
@@ -182,11 +188,12 @@ fn detached_output_is_replayed_after_the_preamble_and_live_bytes_follow() {
     let client = daemon.client();
     let script = format!(
         "{init}; {boot}; {precmd}; printf 'old-output\\n'; read a; \
-         {precmd}; printf 'prompt2 '; read b; printf 'detached:%s\\n' \"$b\"; \
+         {finished}; {precmd}; printf 'prompt2 '; read b; printf 'detached:%s\\n' \"$b\"; \
          read c; printf 'live:%s\\n' \"$c\"; read d",
         init = printf(&init_shell_hook()),
         boot = printf(&bootstrapped_hook()),
         precmd = printf(&precmd_hook()),
+        finished = printf(&command_finished_hook()),
     );
     let id = session_id(1);
     let spawned = client.spawn(id, metadata(), sh_options(&script)).unwrap();
@@ -223,7 +230,9 @@ fn detached_output_is_replayed_after_the_preamble_and_live_bytes_follow() {
     preamble.extend_from_slice(&bootstrapped_hook());
     assert!(replay.starts_with(&preamble));
     let body = &replay[preamble.len()..];
-    assert!(body.starts_with(&precmd_hook()));
+    let mut prompt_start = command_finished_hook();
+    prompt_start.extend_from_slice(&precmd_hook());
+    assert!(body.starts_with(&prompt_start));
     assert!(!contains(body, b"old-output"));
     let prompt = find(body, b"prompt2 ").unwrap();
     let detached = find(body, b"detached:two").unwrap();
@@ -351,18 +360,47 @@ fn prune_kills_detached_sessions_that_are_not_kept() {
 }
 
 #[test]
-fn spawning_an_existing_session_fails() {
+fn spawning_an_existing_session_replaces_it() {
     let daemon = TestDaemon::start();
     let client = daemon.client();
-    let _first = client
+    let first = client
         .spawn(session_id(8), metadata(), sh_options("read x"))
         .unwrap();
-    let err = client
+    let old_pid = first.info.pid;
+    let second = client
         .spawn(session_id(8), metadata(), sh_options("read x"))
-        .err()
         .unwrap();
-    assert!(err.to_string().contains("already exists"));
+    assert_ne!(second.info.pid, old_pid);
+    assert_eq!(second.info.replay_len, 0);
+    assert!(!process_exists(old_pid));
+    assert!(process_exists(second.info.pid));
+    let mut old_data = stream(first.data);
+    assert!(read_to_eof(&mut old_data).is_empty());
+
+    let sessions = client.list().unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].pid, second.info.pid);
+    assert!(sessions[0].attached);
     assert!(client.attach(session_id(9)).is_err());
+}
+
+#[test]
+fn spawning_over_a_detached_session_replaces_it() {
+    let daemon = TestDaemon::start();
+    let client = daemon.client();
+    let first = client
+        .spawn(session_id(15), metadata(), sh_options("read x"))
+        .unwrap();
+    client.detach_all();
+
+    let second_client = daemon.client();
+    let second = second_client
+        .spawn(session_id(15), metadata(), sh_options("read x"))
+        .unwrap();
+    assert!(!process_exists(first.info.pid));
+    let sessions = second_client.list().unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].pid, second.info.pid);
 }
 
 #[test]

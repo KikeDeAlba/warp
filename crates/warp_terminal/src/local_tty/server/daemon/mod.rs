@@ -574,7 +574,8 @@ impl Daemon {
         mut options: PtyOptions,
     ) -> Result<()> {
         if self.sessions.contains_key(&id) {
-            bail!("session already exists");
+            log::info!("Replacing an existing session on spawn");
+            self.kill_session(id);
         }
         options.close_fds = true;
         let info = local_tty::spawn(options)?;
