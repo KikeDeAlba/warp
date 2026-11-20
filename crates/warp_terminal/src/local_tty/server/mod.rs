@@ -44,7 +44,7 @@ pub use self::api::{
     DaemonResponse, PersistentSessionId, RING_CAPACITY, SessionMetadata, SessionSummary,
 };
 pub use self::client::TerminalServerClient;
-pub use self::daemon_client::{AttachedSession, DaemonClient};
+pub use self::daemon_client::{AttachedSession, DaemonClient, DaemonPtyHandle};
 use super::spawner::PtyHandle;
 
 /// The file descriptor of the Unix domain socket where the terminal server will
@@ -72,6 +72,10 @@ pub fn run_terminal_server(
     // We initialize context-independent feature flags early, as the terminal
     // server process may need to reference them. User-controlled flags are overridden
     // soon after.
+    if args.daemon {
+        daemon::run_daemon_process(init_feature_flags, init_platform);
+        return;
+    }
     init_feature_flags();
     let event_loop = event_loop::EventLoop::new(args);
     event_loop.run(init_platform)
