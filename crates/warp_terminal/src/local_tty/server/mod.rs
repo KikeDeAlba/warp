@@ -20,6 +20,7 @@
 
 mod api;
 mod client;
+mod daemon_client;
 mod event_loop;
 mod logging;
 mod protocol;
@@ -35,7 +36,12 @@ use nix::sys::socket;
 use parking_lot::Mutex;
 use warp_errors::report_error;
 
+pub use self::api::{
+    AttachInfo, ClientMessage, DAEMON_PROTOCOL_VERSION, DaemonEvent, DaemonMessage, DaemonRequest,
+    DaemonResponse, PersistentSessionId, RING_CAPACITY, SessionMetadata, SessionSummary,
+};
 pub use self::client::TerminalServerClient;
+pub use self::daemon_client::{AttachedSession, DaemonClient};
 use super::spawner::PtyHandle;
 
 /// The file descriptor of the Unix domain socket where the terminal server will

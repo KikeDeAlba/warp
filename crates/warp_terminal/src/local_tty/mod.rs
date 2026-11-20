@@ -79,6 +79,10 @@ pub trait EventedPty: EventedReadWrite {
 
     /// Terminate the PTY process
     fn kill(self) -> Result<()>;
+
+    fn take_replay(&mut self) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
