@@ -37,9 +37,9 @@ Rejected: handing only the PTY fd and reading in the daemon while detached (inco
 - CLI: `warp_cli::TerminalServerArgs` (`crates/warp_cli/src/lib.rs:734`) gains `#[clap(long)] pub daemon: bool`; `--parent-pid` is not required in daemon mode. `run_terminal_server` dispatches on the flag.
 - Startup with `--daemon`, before any thread: double fork (`_exit(0)` in the parent), `setsid()`, `SIGHUP` → `SIG_IGN`, `umask(0o077)`, `chdir("/")`, stdin → `/dev/null`, stdout/stderr → `v{N}.log` (append; truncate at start if > 5 MB), then hardening: `RLIMIT_NOFILE` soft raised to the hard limit (capped at 10240), `RLIMIT_CORE` soft = 0, and on Linux `prctl(PR_SET_DUMPABLE, 0)`; then `flock(v{N}.lock, LOCK_EX|LOCK_NB)` (on failure `exit(0)`; held for life), unlink stale socket, `bind`, `listen`, file logger, `init_platform()` and feature flags as today.
 - Log rotation while running: every tick, if `v{N}.log` exceeds 5 MB it is renamed to `v{N}.log.old` and stdout/stderr are pointed at a fresh file.
-- Connect-or-spawn (client): `connect` + peer uid check + `Hello`; on `ENOENT`/`ECONNREFUSED`, or `EPIPE`/`ECONNRESET`/EOF during the handshake (a daemon that is idle-exiting), run `current_exe() <terminal-server subcommand> --daemon` with null stdio and fds ≥ 3 closed in `pre_exec` (up to the soft `RLIMIT_NOFILE`, capped at 10240; never `sysconf`, which can be -1 or huge), `wait()` the short-lived child, retry `connect` every 50 ms up to 3 s. The daemon's flock serializes races.
+- Connect-or-spawn (client): `connect` + peer uid check + `Hello`; on `ENOENT`/`ECONNREFUSED`, or `EPIPE`/`ECONNRESET`/EOF during the handshake (a daemon that is idle-exiting), run `current_exe() <terminal-server subcommand> --daemon` with null stdio and fds ≥ 3 closed in `pre_exec` (up to the bound `unix.rs` uses for `close_fds`: the soft `RLIMIT_NOFILE`, falling back to a positive `sysconf(_SC_OPEN_MAX)` when it is unlimited, clamped to 3..65536), `wait()` the short-lived child, retry `connect` every 50 ms up to 3 s. The daemon's flock serializes races.
 - Shells are spawned with `local_tty::spawn` and `close_fds = true`; all daemon fds are `CLOEXEC`. `pre_exec` already resets signal dispositions (`unix.rs:502-521`).
-- Spawn context: the daemon must not hand shells its own stale state (the environment of whichever app launched it, its `/` cwd, its raised and hardened limits). `Spawn` carries a `SpawnEnvironment { vars, cwd }` captured by the client (`std::env::vars_os()`, lossless `OsString`s, plus `current_dir()`). For the duration of `local_tty::spawn` the single-threaded daemon replaces its process environment with exactly `vars` (so `env_clear()` + client env; `unix.rs` then applies its Warp overlay and `PtyOptions::env_vars` on top, as in the legacy path), switches its cwd to the client's cwd, and restores the inherited soft `RLIMIT_NOFILE` and `RLIMIT_CORE`; everything is restored afterwards. The shell's initial directory is `start_dir`, else the client's `$HOME` (same as the legacy path), never the daemon's `/`. If a spawn with the inherited fd limit fails (the daemon may be using fds above it), it is retried once with the raised limit. Variables that cannot be set (empty key, `=` or NUL) are skipped. `PR_SET_DUMPABLE` is reset by `execve`.
+- Spawn context: the daemon must not hand shells its own stale state (the environment of whichever app launched it, its `/` cwd, its raised and hardened limits), and it never changes its own process environment, cwd or limits to spawn. `Spawn` carries a `SpawnEnvironment { vars }` captured by the client (`std::env::vars_os()`, lossless `OsString`s). The daemon sets `PtyOptions::base_env = Some(vars)` and `PtyOptions::child_rlimits` to the soft `RLIMIT_NOFILE`/`RLIMIT_CORE` it inherited before hardening. With `base_env`, `unix.rs` builds the command with `env_clear()` + `base_env` (variables that cannot be set — empty key, `=` or NUL — are skipped), resolves `HOME`/`USER`/`LOGNAME` from it, then applies its Warp overlay and `PtyOptions::env_vars` on top, as in the legacy path; `base_env: None` (the app's in-process and legacy terminal-server spawns) inherits the spawner's environment unchanged. In `pre_exec`, after closing fds, the child sets each `child_rlimits` soft limit (clamped to the hard limit, best effort, async-signal-safe `getrlimit`/`setrlimit` only). The shell's initial directory is `start_dir`, else `$HOME` from `base_env` (same as the legacy path), never the daemon's `/`. `PR_SET_DUMPABLE` is reset by `execve`.
 - Idle exit: no sessions (alive or exited-pending) and no client for 60 s (overridable by env var for tests).
 - Control EOF from the app = detach all its sessions; nothing is killed.
 - `Kill`: close the leader, SIGKILL the pid, one `waitpid(WNOHANG)`, reply `Done` right away; SIGCHLD reaps it. The event loop never sleeps or blocks on a single client or process.
@@ -62,7 +62,7 @@ Rejected: handing only the PTY fd and reading in the daemon while detached (inco
 
 ## 4. Contract (`crates/warp_terminal/src/local_tty/server/api.rs`, next to legacy `Message`)
 ```rust
-pub const DAEMON_PROTOCOL_VERSION: u32 = 1;
+pub const DAEMON_PROTOCOL_VERSION: u32 = 2;
 pub const RING_CAPACITY: usize = 10 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -77,7 +77,6 @@ pub struct SessionMetadata {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpawnEnvironment {
     pub vars: Vec<(OsString, OsString)>,
-    pub cwd: Option<OsString>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
