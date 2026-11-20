@@ -1,0 +1,208 @@
+# Persistent local sessions (unix)
+
+## Context
+Quitting Warp kills every local shell. `on_will_terminate` (`app/src/lib.rs:2860`) calls `PtySpawner::prepare_for_app_termination`, which drops `TerminalServer` (`crates/warp_terminal/src/local_tty/spawner.rs:174`, `server/mod.rs:219`); the `Children` drop sends SIGHUP to each shell (`server/event_loop.rs:66`). The server also exits when its parent pid changes or its socketpair closes, and it hands the PTY leader fd to the app and closes its own copy (`server/event_loop.rs:275-301`). Session restoration only restores layout and finished blocks, with a fresh shell.
+
+Goal: shells keep running after quitting Warp and reattach on relaunch, like a terminal-multiplexer server. Closing a tab or pane still kills its process. The feature is a user-facing setting (on by default) that can be toggled from Settings.
+
+Other facts this design relies on:
+- The app uses the leader fd beyond read/write: `TIOCSWINSZ` on resize (panics on failure, `unix.rs:717`), `TerminalAttributesPoller` (`tcgetattr`), and `tcgetpgrp` (`ai/agent_sdk/driver/harness/process_control.rs:56`, `lrc_activity/sampler.rs:220`).
+- Every DCS hook is validated against `registered_session_ids` (`model/ansi/mod.rs:536-562`); the app registers the id at shell spawn (`terminal_manager.rs:1091`).
+- Replaying `InitShell` makes `PtyController::initialize_shell` write the bootstrap script (`writeable_pty/pty_controller.rs:325`).
+- Hook wire format: `ESC P $` + `d` + hex(JSON) + `ESC \` (`assets/bundled/bootstrap/zsh_body.sh:19-25`, `model/ansi/dcs_hooks.rs:17`).
+- `terminal_panes.uuid` (`crates/persistence/src/schema.rs:405`) is stable across restore (`pane_group/mod.rs:1639` → `create_session`, `:6111`); new panes use `Uuid::new_v4()` (`:2180`). It does not reach `TerminalManager::create_model` yet.
+- The current framing does a single `recvmsg` per payload (`server/protocol.rs:153-168`) and carries one fd (`AuxData = [RawFd; 1]`).
+
+## Decision
+1. A per-user, per-protocol-version terminal daemon **owns the PTY**: it always reads it and keeps a 10 MiB ring buffer per session, so processes never block while no app is attached.
+2. Per session the app receives two fds over SCM_RIGHTS: `data` (one end of a daemon-created socketpair, bytes in both directions) and `leader` (a dup of the PTY leader, used by the app **only for ioctls**: resize, termios, tcgetpgrp). No `Resize` message is needed.
+3. Session id = `terminal_panes.uuid`.
+4. Reattach: the daemon sends a **preamble** (raw `InitShell` + `Bootstrapped` DCS of the login shell) followed by the **body** (bytes since the last `Precmd` seen before detach). The app registers the original `hook_session_id`, does not resend the bootstrap script, and parses the replay **before** the live loop, discarding terminal-query replies. This rebuilds `SessionInfo` naturally.
+5. Closing a pane sends `Kill`. Quitting the app detaches. An app crash is a detach.
+
+Rejected: handing only the PTY fd and reading in the daemon while detached (incomplete ring, a crash loses the running block); replay over the control channel (framing cannot carry MBs, small macOS socket buffers); suppressing replies inside `pty_read` by byte counting (chunks mix replay and live bytes).
+
+## 1. Transport
+- Directory: `warp_core::paths::state_dir().join("ts")` (`crates/warp_core/src/paths.rs:260`), mode 0700 (reuse/copy `ensure_private_daemon_dir`, `app/src/remote_server/unix/proxy.rs:88`). Files: `v{DAEMON_PROTOCOL_VERSION}.sock`, `.lock`, `.log`. If the socket path exceeds 100 bytes, use `$TMPDIR/warp-ts-<uid>/` (0700).
+- `umask(0o077)` before `bind`, then `chmod 0600`. On accept, compare the peer uid with `geteuid()` (`getpeereid` on macOS, `SO_PEERCRED` on Linux); close silently on mismatch.
+- Framing: the `protocol.rs` format (BE `usize` header + bincode + SCM_RIGHTS), generalized: `send_frame<T: Serialize>(fd, &T, fds: &[RawFd])`, `cmsg_space!([RawFd; 2])`, a blocking reader that loops until `payload_size`, and a non-blocking `FrameReader` on the daemon side that accumulates bytes and fds. Legacy `api::Message` stays intact.
+- One full-duplex control connection; responses correlate by `request_id`; a client reader thread dispatches responses and events.
+- Single client: a valid `Hello` evicts the previous client (equivalent to a detach for it).
+
+## 2. Daemon lifecycle
+- CLI: `warp_cli::TerminalServerArgs` (`crates/warp_cli/src/lib.rs:734`) gains `#[clap(long)] pub daemon: bool`; `--parent-pid` is not required in daemon mode. `run_terminal_server` dispatches on the flag.
+- Startup with `--daemon`, before any thread: double fork (`_exit(0)` in the parent), `setsid()`, `SIGHUP` → `SIG_IGN`, `umask(0o077)`, `chdir("/")`, stdin → `/dev/null`, stdout/stderr → `v{N}.log` (append; truncate at start if > 5 MB), `flock(v{N}.lock, LOCK_EX|LOCK_NB)` (on failure `exit(0)`; held for life), unlink stale socket, `bind`, `listen`, file logger, `init_platform()` and feature flags as today.
+- Connect-or-spawn (client): `connect` + `Hello`; on `ENOENT`/`ECONNREFUSED` run `current_exe() <terminal-server subcommand> --daemon` with null stdio and fds ≥ 3 closed in `pre_exec`, `wait()` the short-lived child, retry `connect` every 50 ms up to 3 s. The daemon's flock serializes races.
+- Shells are spawned with `local_tty::spawn` and `close_fds = true`; all daemon fds are `CLOEXEC`. `pre_exec` already resets signal dispositions (`unix.rs:502-521`).
+- Idle exit: no sessions (alive or exited-pending) and no client for 60 s (overridable by env var for tests).
+- Control EOF from the app = detach all its sessions; nothing is killed.
+- `Kill`: close the leader, SIGKILL the pid, `waitpid(WNOHANG)` up to 500 ms, reply `Done`; SIGCHLD reaps the rest.
+- Shell exit: drain the leader until `EIO`/`EAGAIN`. If attached: `shutdown(SHUT_WR)` on data, emit `SessionExited`, drop the session. If detached: keep `Exited{status}` + ring until the next `Attach` (delivered, then dropped), `Prune`, or 24 h.
+
+## 3. Ring buffer and replay (daemon)
+- `RING_CAPACITY = 10 MiB` per session, lazily grown, absolute offsets (`total: u64`, `ring_start = total - len`).
+- Incremental DCS scanner: `ESC P $` + `d|f` + payload + `ESC \` (or 0x9C; CAN/SUB abort), payload capped at 1 MiB, tolerant of splits across reads. For `d`, hex-decode and parse only `{hook, value.session_id, value.is_subshell}`:
+  - `Precmd`: record the ESC offset in `precmd_offsets` (pruned on eviction) and keep `last_precmd_raw`.
+  - `Preexec`: keep `last_preexec_raw`.
+  - Login `InitShell` (`is_subshell == false`) followed by the first `Bootstrapped`: store both raw DCS as `preamble`; a new login `InitShell` replaces the pair.
+- On detach (explicit or EOF): `replay_from = last Precmd offset`.
+- Replay = `preamble` + body, where body is the first that applies:
+  1. `ring[replay_from..]` if `replay_from >= ring_start`;
+  2. `ring[oldest_precmd..]` if any remains;
+  3. `last_precmd_raw` + `last_preexec_raw` (if later) + `b"\r\n[output truncated]\r\n"` + `ring[ring_start..]`.
+- On `Attach` the daemon enqueues the replay on the data queue **before** resuming live forwarding, then replies with `replay_len`.
+- Backpressure: per-session outbound queue capped at 4 MiB; above it, stop reading the leader until below 1 MiB. With no client attached, write only to the ring and never block the process.
+
+## 4. Contract (`crates/warp_terminal/src/local_tty/server/api.rs`, next to legacy `Message`)
+```rust
+pub const DAEMON_PROTOCOL_VERSION: u32 = 1;
+pub const RING_CAPACITY: usize = 10 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PersistentSessionId(pub [u8; 16]);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionMetadata {
+    pub hook_session_id: u64,
+    pub shell_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ClientMessage {
+    Hello { protocol_version: u32, client_pid: u32, app_version: Option<String> },
+    Request { request_id: u64, request: DaemonRequest },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DaemonRequest {
+    List,
+    Spawn { session_id: PersistentSessionId, metadata: SessionMetadata, options: Box<PtyOptions> },
+    Attach { session_id: PersistentSessionId },
+    Kill { session_id: PersistentSessionId },
+    Prune { keep: Vec<PersistentSessionId> },
+    DetachAll,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DaemonMessage {
+    HelloAck { protocol_version: u32, daemon_pid: u32 },
+    HelloReject { protocol_version: u32, reason: String },
+    Response { request_id: u64, response: DaemonResponse },
+    Event(DaemonEvent),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DaemonResponse {
+    Sessions(Vec<SessionSummary>),
+    Attached(AttachInfo),
+    Done,
+    Error(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub session_id: PersistentSessionId,
+    pub pid: u32,
+    pub metadata: SessionMetadata,
+    pub exit_status: Option<ObservedExitStatus>,
+    pub attached: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachInfo {
+    pub session_id: PersistentSessionId,
+    pub pid: u32,
+    pub metadata: SessionMetadata,
+    pub replay_len: u64,
+    pub has_bootstrap_preamble: bool,
+    pub exit_status: Option<ObservedExitStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DaemonEvent {
+    SessionExited { session_id: PersistentSessionId, pid: u32, status: ObservedExitStatus },
+}
+```
+Rules:
+- `Attached` always carries fds via SCM_RIGHTS in order `[data, leader]`; `leader` is absent if the session already exited.
+- `Spawn` replies `Attached` with `replay_len = 0`.
+- `Hello` must be the first frame; on version mismatch the daemon replies `HelloReject` and closes.
+
+### 4.1 Client API (side A, `server/daemon_client.rs`, re-exported from `server/mod.rs`)
+```rust
+pub struct DaemonClient { /* … */ }
+impl DaemonClient {
+    pub fn connect_or_spawn() -> anyhow::Result<Arc<Self>>;
+    pub fn connect_existing() -> anyhow::Result<Option<Arc<Self>>>;
+    pub fn list(&self) -> anyhow::Result<Vec<SessionSummary>>;
+    pub fn spawn(&self, id: PersistentSessionId, metadata: SessionMetadata, options: PtyOptions) -> anyhow::Result<AttachedSession>;
+    pub fn attach(&self, id: PersistentSessionId) -> anyhow::Result<AttachedSession>;
+    pub fn prune(&self, keep: Vec<PersistentSessionId>) -> anyhow::Result<()>;
+    pub fn detach_all(&self);
+    pub fn kill_all_attached(&self);
+    pub fn is_alive(&self) -> bool;
+}
+pub struct AttachedSession {
+    pub info: AttachInfo,
+    pub data: OwnedFd,
+    pub leader: Option<OwnedFd>,
+    pub handle: Box<dyn PtyHandle>,
+}
+```
+Client semantics:
+- The reader thread turns `SessionExited` into a `pid → status` entry (same pattern as `server/mod.rs:71-111`) and raises `SIGCHLD` on itself, so `Pty::next_child_event` (`unix.rs:693-710`) works unchanged. The same applies when `attach()` returns `exit_status: Some`.
+- Daemon EOF: every session becomes `Unavailable`, SIGCHLD is raised, `is_alive()` returns false.
+- `DaemonPtyHandle::kill()` is a no-op after `detach_all()`; otherwise it sends `Kill` and waits for `Done`.
+
+### 4.2 Trait change (side B, `local_tty/mod.rs:66`)
+```rust
+fn take_replay(&mut self) -> Option<Vec<u8>> { None }
+```
+In `local_tty/event_loop.rs`, right after `State::default()` and before registering fds: if `take_replay()` returns bytes, run them through `state.parser.parse_bytes` with a reply buffer that is **discarded**, then `send_wakeup_event()`.
+
+### 4.3 Post-replay nudge (side B)
+At the end of `Pty::attach`, `TIOCSWINSZ` with `(rows, cols - 1)` then `(rows, cols)` on `leader`, so TUIs redraw after the replay.
+
+### 4.4 Commit order
+First commit: these types plus `unimplemented!()` stubs for `DaemonClient` and `AttachedSession`, so both sides can build in parallel.
+
+## 5. App rules
+- Setting in `app/src/terminal/general_settings.rs`, after `restore_session`: `persistent_sessions: PersistentSessions`, `bool`, default `true`, mac + linux, `toml_path: "general.persistent_sessions"`, description "Whether shells keep running in the background after quitting Warp and reattach on relaunch."
+- Settings UI in `app/src/settings_view/features_page.rs`: `PersistentSessionsWidget` right after `SessionRestorationWidget`; `FeaturesPageAction::TogglePersistentSessions` handled next to `ToggleRestoreSession` with `toggle_and_save_value`. Label "Keep sessions running after quitting Warp"; description "Shells keep running in the background when you quit Warp and reattach when you reopen it. Closing a tab or pane still ends its process. Requires restoring windows, tabs, and panes on startup." Rendered disabled when `restore_session` is off.
+- Effective value: `persist = cfg!(unix) && persistent_sessions && restore_session && APPIMAGE unset`.
+- Readers: `TerminalManager::create_pty` per pane (daemon vs legacy), startup restore (attach vs `Prune`), `on_will_terminate` (detach vs kill).
+- ON → OFF: new panes use legacy; daemon panes keep working until closed; on quit `kill_all_attached()` instead of `detach_all()`. OFF → ON: new panes only. No restart needed.
+- Uuid plumbing: `create_session` → `create_model`/`create_model_with_manager` gain `persistent_session_id: Option<PersistentSessionId>` → `on_shell_determined` → `create_pty`. `create_tui_model` and `spawn_replacement_shell` pass `None`.
+- New pane with `persist`: lazy `connect_or_spawn` stored in `PtySpawner` as `Option<Arc<DaemonClient>>`; `spawn(uuid, {hook_session_id, shell_type}, options)`; `Pty::from_attached`. On failure: report once, mark the daemon unavailable for this run, fall back to legacy `spawn_pty`.
+- Restore: `list()` once (cached). If the uuid exists with `has_bootstrap_preamble`: keep `set_login_shell_spawned`/`set_pending_shell_launch_data`, `register_session_id(SessionId::from(hook_session_id))` instead of the generated id, skip `enqueue_init_script`, set `PtyController::skip_next_bootstrap_write()` (consumed by `initialize_shell`), store `replay_len` in `Pty` for `take_replay` (blocking read, 5 s timeout), use `leader` for `ShellProcessInfo` and `TerminalAttributesPoller`. If attach fails or there is no preamble: `Kill` + `spawn` with the same uuid and normal bootstrap.
+- Prune after windows are restored: if `connect_existing()` finds a daemon, `prune(terminal uuids in the snapshot)`; with `persist` off, `prune(vec![])`. Never start a daemon just to prune.
+- `Pty` (`unix.rs:207`): new `leader: Option<File>` and `replay: Option<u64>`; `get_fd()` returns the leader if present; `on_resize` ioctls on `get_fd()`; `kill` drops `fd` and `leader` **before** `pty_handle.kill()` (keeps the macOS 'E' state fix, `unix.rs:727-736`).
+- Quit: `prepare_for_app_termination(detach_sessions: bool)` with `persist`; calls `detach_all()` or `kill_all_attached()`, then drops the legacy server as today.
+- Quit warning (`quit_warning/mod.rs:353`): with `persist`, say running commands "will keep running in the background".
+
+## 6. Fallbacks
+| Case | Behavior |
+|---|---|
+| `persist` off | Full legacy path; `Prune(vec![])` at startup only if a daemon exists. |
+| Non-unix | Everything under `cfg(unix)`; Windows unchanged. |
+| Cannot connect/spawn in 3 s | One `report_error`, legacy for the run, restored panes get fresh shells. |
+| `HelloReject` | Same as above; the old daemon is left running with its sessions (documented limitation). |
+| Daemon dies | Panes end as `Unavailable`; the next new pane retries `connect_or_spawn` once. |
+| AppImage (`APPIMAGE` set) | Feature disabled (binary unmount can SIGBUS the daemon). |
+
+## 7. Risks
+1. Rebuilt bootstrap: the preamble moves the model from `WarpInput` straight to `Bootstrapped` and the replayed hook triggers follow-up events. Side B validates this with a model test first; plan B is `set_bootstrapped()` plus a synthetic `Sessions` entry.
+2. Warpified subshells/SSH use other session ids and are rejected on replay; shown as plain text in v1.
+3. If the app crashed before persisting, blocks before `replay_from` are lost (never duplicated).
+4. macOS: no app sandbox found; hardened runtime allows fork/exec/setsid. Bundle replacement is safe with atomic rename.
+5. Linux: systemd `KillUserProcesses` kills the daemon on logout (accepted).
+6. Extra hop PTY → daemon → socket → app; measure with `yes | head -c 1G`.
+7. Up to 10 MiB per busy session.
+
+## 8. Tests
+Side A: round-trip of every message over a socketpair (2 fds, payloads > 1 MiB split); scanner byte-by-byte with hex Precmd/Preexec/InitShell/Bootstrapped, foreign DCS ignored, CAN abort, payload cap; ring eviction, `precmd_offsets` pruning and the three body cases; integration in a temp dir with `/bin/sh`: spawn → detach → output → attach with correct replay, Kill, `SessionExited` while attached, exited session delivered on Attach, Prune, short idle exit, second daemon exits on held lock, socket 0600 / dir 0700, `HelloReject`, 50 MB while detached without blocking the child.
+
+Side B: event loop with a mock `EventedPty` whose replay contains `ESC[c` leaves the write queue empty and live bytes are processed afterwards; `Pty` over socketpair + openpty resizes via the leader; model test: restored `TerminalModel` + `register_session_id` + preamble + Precmd + Preexec + output → bootstrapped, running active block with that output, no bootstrap write; setting default `true` and key `general.persistent_sessions`; `prepare_for_app_termination(true)` makes `kill()` a no-op, `false` sends `Kill`.
+
+## Consequences
+Sessions survive quitting and app crashes. One resident process per user, exiting after 60 s idle. Closing a pane still kills its process. Persistence requires session restoration. A new protocol version does not reattach sessions from the previous one.
