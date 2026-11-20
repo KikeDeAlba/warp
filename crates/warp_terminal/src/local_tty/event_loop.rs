@@ -286,10 +286,12 @@ where
         Ok(())
     }
 
-    /// Feeds bytes replayed from a reattached session through the parser.
+    /// Feeds bytes replayed from a reattached session, or drained after its
+    /// shell exited, through the parser.
     ///
     /// Replies to terminal queries are discarded: they were already answered
-    /// by the client that was attached when the bytes were first produced.
+    /// by the client that was attached when the bytes were first produced, or
+    /// there is no process left to read them.
     fn process_replay(&mut self, state: &mut State, replay: &[u8]) {
         let mut discarded_replies = Vec::new();
         for chunk in replay.chunks(MAX_LOCKED_READ) {
@@ -448,6 +450,9 @@ where
                                 if let Some(local_tty::ChildEvent::Exited(status)) =
                                     self.pty.next_child_event()
                                 {
+                                    if let Some(output) = self.pty.drain_after_exit() {
+                                        self.process_replay(&mut state, &output);
+                                    }
                                     self.terminal
                                         .lock()
                                         .exit(ExitReason::ShellProcessExited { status });

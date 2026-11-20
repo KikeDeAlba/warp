@@ -9,6 +9,7 @@ use {
         TerminalServer,
     },
     anyhow::bail,
+    parking_lot::Mutex,
     std::cmp::Reverse,
     std::collections::HashMap,
     std::ffi::OsString,
@@ -142,7 +143,7 @@ pub struct PtySpawner {
     #[cfg(unix)]
     server: Option<TerminalServer>,
     #[cfg(unix)]
-    daemon: PersistentSessions,
+    daemon: PersistentSessionsHandle,
 }
 
 /// The operations the app needs from the persistent session daemon.
@@ -202,9 +203,12 @@ impl PersistentSessionDaemon for DaemonClient {
 type DaemonHandle = Arc<dyn PersistentSessionDaemon>;
 
 #[cfg(unix)]
+type DaemonFactory<T> = Box<dyn Fn() -> Result<T> + Send + Sync>;
+
+#[cfg(unix)]
 pub(crate) struct DaemonConnector {
-    pub connect_or_spawn: Box<dyn Fn() -> Result<DaemonHandle>>,
-    pub connect_existing: Box<dyn Fn() -> Result<Option<DaemonHandle>>>,
+    pub connect_or_spawn: DaemonFactory<DaemonHandle>,
+    pub connect_existing: DaemonFactory<Option<DaemonHandle>>,
 }
 
 #[cfg(unix)]
@@ -227,6 +231,18 @@ enum DaemonState {
     NotConnected,
     Connected(DaemonHandle),
     Unavailable,
+}
+
+/// The result of trying to reattach a restored pane to its daemon session.
+#[cfg(unix)]
+pub enum ReattachOutcome {
+    /// The daemon handed the session over.
+    Attached(AttachedSession),
+    /// No running daemon knows the session, so a new one can take its id.
+    NotFound,
+    /// The daemon knows (or may know) the session but attaching failed; the
+    /// session is left untouched.
+    Failed,
 }
 
 /// Connection state for the persistent session daemon, established lazily.
@@ -306,69 +322,41 @@ impl PersistentSessions {
         }
     }
 
-    fn spawn(
-        &mut self,
-        id: PersistentSessionId,
-        metadata: SessionMetadata,
-        options: PtyOptions,
-        hooks: &dyn PtySpawnHooks,
-    ) -> Result<AttachedSession> {
-        let Some(daemon) = self.connect_or_spawn(hooks) else {
-            bail!("persistent session daemon is unavailable");
-        };
-        daemon.spawn(id, metadata, options)
-    }
-
-    fn attach(&mut self, id: PersistentSessionId) -> Option<AttachedSession> {
+    /// Returns the daemon to attach `id` through, if a running daemon reported
+    /// it. Lists the daemon's sessions on first use.
+    fn daemon_for_reattach(&mut self, id: PersistentSessionId) -> Result<Option<DaemonHandle>, ()> {
         if self
             .listed_sessions
             .as_ref()
             .is_some_and(|sessions| sessions.is_empty())
         {
-            return None;
+            return Ok(None);
         }
         let Some(daemon) = self.connect_existing() else {
             self.listed_sessions = Some(HashMap::new());
-            return None;
+            return Ok(None);
         };
-        let listed_sessions = self
-            .listed_sessions
-            .get_or_insert_with(|| match daemon.list() {
-                Ok(sessions) => sessions
-                    .into_iter()
-                    .map(|session| (session.session_id, session))
-                    .collect(),
+        if self.listed_sessions.is_none() {
+            match daemon.list() {
+                Ok(sessions) => {
+                    self.listed_sessions = Some(
+                        sessions
+                            .into_iter()
+                            .map(|session| (session.session_id, session))
+                            .collect(),
+                    );
+                }
                 Err(err) => {
                     log::warn!("Failed to list persistent sessions: {err:#}");
-                    HashMap::new()
+                    return Err(());
                 }
-            });
-        listed_sessions.remove(&id)?;
-
-        let mut session = match daemon.attach(id) {
-            Ok(session) => session,
-            Err(err) => {
-                log::warn!("Failed to reattach persistent session: {err:#}");
-                return None;
             }
-        };
-        if !session.info.has_bootstrap_preamble {
-            log::info!("Persistent session has no bootstrap preamble; starting a fresh shell");
-            if let Err(err) = session.handle.kill() {
-                log::warn!("Failed to kill persistent session without preamble: {err:#}");
-            }
-            return None;
         }
-        Some(session)
-    }
-
-    fn prune(&mut self, keep: Vec<PersistentSessionId>) {
-        let Some(daemon) = self.connect_existing() else {
-            return;
-        };
-        if let Err(err) = daemon.prune(keep) {
-            log::warn!("Failed to prune persistent sessions: {err:#}");
-        }
+        let listed = self
+            .listed_sessions
+            .as_mut()
+            .is_some_and(|sessions| sessions.remove(&id).is_some());
+        Ok(listed.then_some(daemon))
     }
 
     fn release(&mut self, detach_sessions: bool) {
@@ -385,6 +373,106 @@ impl PersistentSessions {
     }
 }
 
+/// A shareable handle to the persistent session daemon state, so blocking
+/// daemon calls can run off the main thread.
+#[cfg(unix)]
+#[derive(Clone)]
+pub struct PersistentSessionsHandle {
+    sessions: Arc<Mutex<PersistentSessions>>,
+    backed: Arc<Mutex<HashMap<PersistentSessionId, DaemonHandle>>>,
+}
+
+#[cfg(unix)]
+impl PersistentSessionsHandle {
+    fn new(connector: DaemonConnector) -> Self {
+        Self {
+            sessions: Arc::new(Mutex::new(PersistentSessions::new(connector))),
+            backed: Default::default(),
+        }
+    }
+
+    fn mark_backed(&self, id: PersistentSessionId, daemon: DaemonHandle) {
+        self.backed.lock().insert(id, daemon);
+    }
+
+    /// Reattaches to a session that survived a previous run of the app.
+    ///
+    /// Blocks on daemon IPC, so call it off the main thread. Never starts a
+    /// daemon and never kills a session.
+    pub fn reattach(&self, id: PersistentSessionId) -> ReattachOutcome {
+        let daemon = match self.sessions.lock().daemon_for_reattach(id) {
+            Ok(Some(daemon)) => daemon,
+            Ok(None) => return ReattachOutcome::NotFound,
+            Err(()) => return ReattachOutcome::Failed,
+        };
+        match daemon.attach(id) {
+            Ok(session) => {
+                if !session.info.has_bootstrap_preamble {
+                    log::info!(
+                        "Persistent session has no bootstrap preamble; showing its output as is"
+                    );
+                }
+                self.mark_backed(id, daemon);
+                ReattachOutcome::Attached(session)
+            }
+            Err(err) => {
+                log::warn!("Failed to reattach persistent session: {err:#}");
+                ReattachOutcome::Failed
+            }
+        }
+    }
+
+    /// Spawns a shell owned by the daemon, connecting to (or starting) the
+    /// daemon on first use.
+    fn spawn(
+        &self,
+        id: PersistentSessionId,
+        metadata: SessionMetadata,
+        options: PtyOptions,
+        hooks: &dyn PtySpawnHooks,
+    ) -> Result<AttachedSession> {
+        let mut sessions = self.sessions.lock();
+        let Some(daemon) = sessions.connect_or_spawn(hooks) else {
+            bail!("persistent session daemon is unavailable");
+        };
+        if let Some(listed) = sessions.listed_sessions.as_mut() {
+            listed.remove(&id);
+        }
+        let session = daemon.spawn(id, metadata, options)?;
+        self.mark_backed(id, daemon);
+        Ok(session)
+    }
+
+    /// Kills daemon sessions that are neither in `keep` nor owned by a pane of
+    /// this run. Does nothing if no daemon is running.
+    ///
+    /// Holds the state lock for the whole request, so a pane spawned meanwhile
+    /// is never pruned.
+    pub fn prune(&self, mut keep: Vec<PersistentSessionId>) {
+        let mut sessions = self.sessions.lock();
+        let Some(daemon) = sessions.connect_existing() else {
+            return;
+        };
+        keep.extend(self.backed.lock().keys().copied());
+        if let Err(err) = daemon.prune(keep) {
+            log::warn!("Failed to prune persistent sessions: {err:#}");
+        }
+    }
+
+    /// Whether the shell of `id` is owned by a live daemon, so it can outlive
+    /// the app.
+    pub fn is_backed(&self, id: PersistentSessionId) -> bool {
+        self.backed
+            .lock()
+            .get(&id)
+            .is_some_and(|daemon| daemon.is_alive())
+    }
+
+    fn release(&self, detach_sessions: bool) {
+        self.sessions.lock().release(detach_sessions);
+    }
+}
+
 impl PtySpawner {
     /// Creates a new PtySpawner.
     ///
@@ -397,7 +485,7 @@ impl PtySpawner {
                 let server = super::server::TerminalServer::new()?;
                 Ok(Self {
                     server: Some(server),
-                    daemon: PersistentSessions::new(DaemonConnector::default()),
+                    daemon: PersistentSessionsHandle::new(DaemonConnector::default()),
                 })
             } else if #[cfg(target_os = "windows")] {
                 Ok(Self {})
@@ -413,7 +501,7 @@ impl PtySpawner {
             if #[cfg(unix)] {
                 Self {
                     server: None,
-                    daemon: PersistentSessions::new(DaemonConnector {
+                    daemon: PersistentSessionsHandle::new(DaemonConnector {
                         connect_or_spawn: Box::new(|| bail!("no persistent session daemon in tests")),
                         connect_existing: Box::new(|| Ok(None)),
                     }),
@@ -430,7 +518,7 @@ impl PtySpawner {
     pub(crate) fn new_for_test_with_daemon(connector: DaemonConnector) -> Self {
         Self {
             server: None,
-            daemon: PersistentSessions::new(connector),
+            daemon: PersistentSessionsHandle::new(connector),
         }
     }
 
@@ -468,24 +556,18 @@ impl PtySpawner {
         self.daemon.spawn(id, metadata, options, hooks)
     }
 
-    /// Reattaches to a session that survived a previous run of the app.
-    ///
-    /// Returns `None` when there is no running daemon, the daemon does not know
-    /// `id`, or the session cannot be resumed without bootstrapping again (in
-    /// which case it is killed so a fresh shell can take its id).
+    /// Returns a handle to the daemon state that can be used off the main
+    /// thread.
     #[cfg(unix)]
-    pub fn attach_persistent_session(
-        &mut self,
-        id: PersistentSessionId,
-    ) -> Option<AttachedSession> {
-        self.daemon.attach(id)
+    pub fn persistent_sessions(&self) -> PersistentSessionsHandle {
+        self.daemon.clone()
     }
 
-    /// Kills daemon sessions that are not in `keep`. Does nothing if no daemon
-    /// is running.
+    /// Whether the shell of `id` is owned by a live daemon, so it can outlive
+    /// the app.
     #[cfg(unix)]
-    pub fn prune_persistent_sessions(&mut self, keep: Vec<PersistentSessionId>) {
-        self.daemon.prune(keep);
+    pub fn is_persistent_session_backed(&self, id: PersistentSessionId) -> bool {
+        self.daemon.is_backed(id)
     }
 
     /// Spawns a pty, returning information about the pty and a handle that can

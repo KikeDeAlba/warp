@@ -36,8 +36,10 @@ use super::event_loop::{PTY_TOKEN, SIGNALS_TOKEN};
 use super::server::{
     AttachInfo, AttachedSession, PersistentSessionId, RING_CAPACITY, SessionMetadata,
 };
-use super::spawner::{PtyHandle, PtySpawnHooks, PtySpawnInfo, PtySpawner};
-use super::{ChildEvent, EventedPty, EventedReadWrite, PtyOptions, SizeInfo};
+use super::spawner::{
+    PersistentSessionsHandle, PtyHandle, PtySpawnHooks, PtySpawnInfo, PtySpawner, ReattachOutcome,
+};
+use super::{ChildEvent, EventedPty, EventedReadWrite, PersistentReattach, PtyOptions, SizeInfo};
 use crate::ASSETS;
 use crate::bootstrap::raw_init_shell_script_for_shell;
 use crate::local_tty::docker_sandbox::{DOCKER_SANDBOX_HOME_DIR, DockerSandboxShellStarter};
@@ -221,12 +223,26 @@ pub struct Pty {
     signals_token: mio::Token,
 }
 
+/// A daemon session handed over to this app, ready to become a [`Pty`].
+pub struct ReattachedSession {
+    session: AttachedSession,
+    signals: Signals,
+}
+
+impl ReattachedSession {
+    pub fn info(&self) -> &AttachInfo {
+        &self.session.info
+    }
+}
+
 struct PersistentPtyState {
     info: AttachInfo,
     pending_replay: Option<u64>,
 }
 
 const REPLAY_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const EXIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const EXIT_DRAIN_LIMIT: u64 = RING_CAPACITY as u64;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PtySpawnResult {
@@ -499,7 +515,7 @@ fn spawn_command_in_pty(
     let is_isolated = warp_isolation_platform::detect().is_some();
 
     unsafe {
-        let fdlimit = libc::sysconf(libc::_SC_OPEN_MAX) as i32;
+        let fdlimit = close_fds_upper_bound();
 
         command.pre_exec(move || {
             // IMPORTANT: THIS FUNCTION IS RUN AFTER FORK.
@@ -668,13 +684,14 @@ impl Pty {
         Ok(Self::from_attached_with_signals(session, &size, signals))
     }
 
-    /// Reattaches to a session that kept running in the daemon, if there is one
-    /// for `session_id` that can be resumed without bootstrapping it again.
-    pub fn attach_persistent(
+    /// Reattaches to a session that kept running in the daemon.
+    ///
+    /// Blocks on daemon IPC, so call it off the main thread, then finish with
+    /// [`Pty::from_reattached`].
+    pub fn reattach_persistent(
+        sessions: &PersistentSessionsHandle,
         session_id: PersistentSessionId,
-        size: &SizeInfo,
-        ctx: &mut AppContext,
-    ) -> Option<Self> {
+    ) -> PersistentReattach {
         // Prepare signal handling first: attaching to an exited session raises
         // SIGCHLD right away.
         let signals = match Signals::new([signal_hook::consts::SIGCHLD]) {
@@ -684,13 +701,22 @@ impl Pty {
                     anyhow::Error::from(err)
                         .context("Failed to prepare signal handling for persistent session")
                 );
-                return None;
+                return PersistentReattach::Failed;
             }
         };
-        let session = PtySpawner::handle(ctx).update(ctx, |pty_spawner, _| {
-            pty_spawner.attach_persistent_session(session_id)
-        })?;
-        Some(Self::from_attached_with_signals(session, size, signals))
+        match sessions.reattach(session_id) {
+            ReattachOutcome::Attached(session) => {
+                PersistentReattach::Attached(ReattachedSession { session, signals })
+            }
+            ReattachOutcome::NotFound => PersistentReattach::NotFound,
+            ReattachOutcome::Failed => PersistentReattach::Failed,
+        }
+    }
+
+    /// Wraps a session returned by [`Pty::reattach_persistent`].
+    pub fn from_reattached(reattached: ReattachedSession, size: &SizeInfo) -> Self {
+        let ReattachedSession { session, signals } = reattached;
+        Self::from_attached_with_signals(session, size, signals)
     }
 
     /// Wraps a session handed over by the daemon.
@@ -752,27 +778,7 @@ impl Pty {
     }
 
     fn read_replay(&mut self, len: u64) -> Vec<u8> {
-        let mut replay = Vec::with_capacity(len.min(RING_CAPACITY as u64 * 2) as usize);
-        let deadline = Instant::now() + REPLAY_READ_TIMEOUT;
-        let mut buf = [0u8; 0x1_0000];
-        while (replay.len() as u64) < len {
-            let remaining = (len - replay.len() as u64).min(buf.len() as u64) as usize;
-            match io::Read::read(&mut self.fd, &mut buf[..remaining]) {
-                Ok(0) => break,
-                Ok(n) => replay.extend_from_slice(&buf[..n]),
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                    let now = Instant::now();
-                    if now >= deadline || !wait_readable(self.fd.as_raw_fd(), deadline - now) {
-                        break;
-                    }
-                }
-                Err(err) => {
-                    log::warn!("Failed to read session replay: {err}");
-                    break;
-                }
-            }
-        }
+        let (replay, _) = read_session_bytes(&mut self.fd, len, REPLAY_READ_TIMEOUT);
         if (replay.len() as u64) < len {
             log::warn!(
                 "Read {} of {len} replay bytes for reattached session",
@@ -781,6 +787,64 @@ impl Pty {
         }
         replay
     }
+}
+
+const CLOSE_FDS_FALLBACK_LIMIT: c_int = 1024;
+const CLOSE_FDS_MAX_LIMIT: c_int = 65536;
+
+/// Returns the exclusive upper bound of the fds a spawned shell closes when
+/// `close_fds` is set.
+///
+/// Prefers the soft `RLIMIT_NOFILE` and falls back to `sysconf`, since either
+/// can be unlimited or fail; the result is capped so the post-fork loop stays
+/// short.
+fn close_fds_upper_bound() -> c_int {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    let from_rlimit = (unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0
+        && limit.rlim_cur != libc::RLIM_INFINITY)
+        .then_some(limit.rlim_cur);
+    let from_sysconf = || {
+        let value = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+        (value > 0).then_some(value as u64)
+    };
+    close_fds_limit(from_rlimit.or_else(from_sysconf))
+}
+
+fn close_fds_limit(limit: Option<u64>) -> c_int {
+    limit.map_or(CLOSE_FDS_FALLBACK_LIMIT, |limit| {
+        limit.clamp(3, CLOSE_FDS_MAX_LIMIT as u64) as c_int
+    })
+}
+
+/// Reads up to `limit` bytes from a non-blocking session socket, waiting for
+/// more until `timeout` elapses. Returns the bytes and whether the peer closed
+/// the socket.
+fn read_session_bytes(fd: &mut File, limit: u64, timeout: Duration) -> (Vec<u8>, bool) {
+    let mut bytes = Vec::with_capacity(limit.min(RING_CAPACITY as u64 * 2) as usize);
+    let deadline = Instant::now() + timeout;
+    let mut buf = [0u8; 0x1_0000];
+    while (bytes.len() as u64) < limit {
+        let remaining = (limit - bytes.len() as u64).min(buf.len() as u64) as usize;
+        match io::Read::read(fd, &mut buf[..remaining]) {
+            Ok(0) => return (bytes, true),
+            Ok(n) => bytes.extend_from_slice(&buf[..n]),
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                let now = Instant::now();
+                if now >= deadline || !wait_readable(fd.as_raw_fd(), deadline - now) {
+                    break;
+                }
+            }
+            Err(err) => {
+                log::warn!("Failed to read from persistent session: {err}");
+                break;
+            }
+        }
+    }
+    (bytes, false)
 }
 
 fn wait_readable(fd: RawFd, timeout: Duration) -> bool {
@@ -917,6 +981,16 @@ impl EventedPty for Pty {
     fn take_replay(&mut self) -> Option<Vec<u8>> {
         let len = self.persistent.as_mut()?.pending_replay.take()?;
         Some(self.read_replay(len))
+    }
+
+    fn drain_after_exit(&mut self) -> Option<Vec<u8>> {
+        self.persistent.as_ref()?;
+        let (output, closed) =
+            read_session_bytes(&mut self.fd, EXIT_DRAIN_LIMIT, EXIT_DRAIN_TIMEOUT);
+        if !closed {
+            log::warn!("Persistent session did not close its output after exiting");
+        }
+        Some(output)
     }
 }
 

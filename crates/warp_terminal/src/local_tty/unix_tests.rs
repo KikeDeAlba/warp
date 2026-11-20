@@ -246,3 +246,41 @@ fn attached_pty_kill_closes_fds_before_killing() {
             .load(std::sync::atomic::Ordering::SeqCst)
     );
 }
+
+#[test]
+fn attached_pty_drains_output_until_eof_after_exit() {
+    let mut fixture = attached_pty(b"", &SizeInfo::new_without_font_metrics(24, 80));
+    io::Write::write_all(&mut fixture.peer, b"last words\r\n").unwrap();
+    fixture.peer.shutdown(std::net::Shutdown::Write).unwrap();
+
+    assert_eq!(
+        fixture.pty.drain_after_exit().as_deref(),
+        Some(&b"last words\r\n"[..])
+    );
+}
+
+#[test]
+fn attached_pty_drain_gives_up_without_eof() {
+    let mut fixture = attached_pty(b"", &SizeInfo::new_without_font_metrics(24, 80));
+    io::Write::write_all(&mut fixture.peer, b"partial").unwrap();
+
+    let started = Instant::now();
+    let drained = fixture.pty.drain_after_exit();
+
+    assert_eq!(drained.as_deref(), Some(&b"partial"[..]));
+    assert!(started.elapsed() < EXIT_DRAIN_TIMEOUT * 3);
+}
+
+#[test]
+fn close_fds_limit_falls_back_and_is_capped() {
+    assert_eq!(close_fds_limit(None), CLOSE_FDS_FALLBACK_LIMIT);
+    assert_eq!(close_fds_limit(Some(256)), 256);
+    assert_eq!(close_fds_limit(Some(u64::MAX)), CLOSE_FDS_MAX_LIMIT);
+    assert_eq!(close_fds_limit(Some(0)), 3);
+}
+
+#[test]
+fn close_fds_upper_bound_is_sane() {
+    let limit = close_fds_upper_bound();
+    assert!((3..=CLOSE_FDS_MAX_LIMIT).contains(&limit));
+}

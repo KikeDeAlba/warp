@@ -83,6 +83,25 @@ pub trait EventedPty: EventedReadWrite {
     fn take_replay(&mut self) -> Option<Vec<u8>> {
         None
     }
+
+    /// Reads the output still in flight after the child exited, for PTYs whose
+    /// bytes are relayed and can trail the exit notification.
+    fn drain_after_exit(&mut self) -> Option<Vec<u8>> {
+        None
+    }
+}
+
+/// The result of trying to reattach a restored pane to the shell it had in a
+/// previous run of the app.
+pub enum PersistentReattach {
+    /// The persistent session daemon handed the shell over.
+    #[cfg(unix)]
+    Attached(ReattachedSession),
+    /// There is no shell to reattach to, so a new one can take the pane's id.
+    NotFound,
+    /// The shell may still exist but could not be reattached; it is left
+    /// running.
+    Failed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
