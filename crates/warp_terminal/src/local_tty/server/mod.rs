@@ -20,6 +20,7 @@
 
 mod api;
 mod client;
+mod daemon;
 mod daemon_client;
 mod event_loop;
 mod logging;
