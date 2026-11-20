@@ -17,7 +17,7 @@ Other facts this design relies on:
 1. A per-user, per-protocol-version terminal daemon **owns the PTY**: it always reads it and keeps a 10 MiB ring buffer per session, so processes never block while no app is attached.
 2. Per session the app receives two fds over SCM_RIGHTS: `data` (one end of a daemon-created socketpair, bytes in both directions) and `leader` (a dup of the PTY leader, used by the app **only for ioctls**: resize, termios, tcgetpgrp). No `Resize` message is needed.
 3. Session id = `terminal_panes.uuid`.
-4. Reattach: the daemon sends a **preamble** (raw `InitShell` + `Bootstrapped` DCS of the login shell) followed by the **body** (bytes since the last `Precmd` seen before detach). The app registers the original `hook_session_id`, does not resend the bootstrap script, and parses the replay **before** the live loop, discarding terminal-query replies. This rebuilds `SessionInfo` naturally.
+4. Reattach: the daemon sends a **preamble** (raw `InitShell` + `Bootstrapped` DCS of the login shell) followed by the **body** (bytes since the `CommandFinished` that immediately precedes the last `Precmd` seen before detach). The app registers the original `hook_session_id`, does not resend the bootstrap script, and parses the replay **before** the live loop, discarding terminal-query replies. This rebuilds `SessionInfo` naturally.
 5. Closing a pane sends `Kill`. Quitting the app detaches. An app crash is a detach.
 
 Rejected: handing only the PTY fd and reading in the daemon while detached (incomplete ring, a crash loses the running block); replay over the control channel (framing cannot carry MBs, small macOS socket buffers); suppressing replies inside `pty_read` by byte counting (chunks mix replay and live bytes).
@@ -42,14 +42,15 @@ Rejected: handing only the PTY fd and reading in the daemon while detached (inco
 ## 3. Ring buffer and replay (daemon)
 - `RING_CAPACITY = 10 MiB` per session, lazily grown, absolute offsets (`total: u64`, `ring_start = total - len`).
 - Incremental DCS scanner: `ESC P $` + `d|f` + payload + `ESC \` (or 0x9C; CAN/SUB abort), payload capped at 1 MiB, tolerant of splits across reads. For `d`, hex-decode and parse only `{hook, value.session_id, value.is_subshell}`:
-  - `Precmd`: record the ESC offset in `precmd_offsets` (pruned on eviction) and keep `last_precmd_raw`.
+  - `CommandFinished`: keep it as pending (`last_command_finished_raw`); a `Preexec` clears a pending one.
+  - `Precmd`: a prompt starts at the pending `CommandFinished` (if any, it is consumed) or else at the `Precmd` itself. Record that start offset in `prompt_starts` (pruned on eviction) and keep `last_command_finished_raw` + `last_precmd_raw` for the last prompt.
   - `Preexec`: keep `last_preexec_raw`.
   - Login `InitShell` (`is_subshell == false`) followed by the first `Bootstrapped`: store both raw DCS as `preamble`; a new login `InitShell` replaces the pair.
-- On detach (explicit or EOF): `replay_from = last Precmd offset`.
+- On detach (explicit or EOF): `replay_from` = offset of the `CommandFinished` immediately before the last `Precmd`, or that `Precmd`'s offset if there is none (0 if no prompt yet). Starting at `CommandFinished` lets the restored model leave the hidden bootstrap block (risk 7.1).
 - Replay = `preamble` + body, where body is the first that applies:
   1. `ring[replay_from..]` if `replay_from >= ring_start`;
-  2. `ring[oldest_precmd..]` if any remains;
-  3. `last_precmd_raw` + `last_preexec_raw` (if later) + `b"\r\n[output truncated]\r\n"` + `ring[ring_start..]`.
+  2. `ring[oldest_prompt_start..]` if any remains;
+  3. `last_command_finished_raw` (if paired with the last prompt) + `last_precmd_raw` + `last_preexec_raw` (if later) + `b"\r\n[output truncated]\r\n"` + `ring[ring_start..]`.
 - On `Attach` the daemon enqueues the replay on the data queue **before** resuming live forwarding, then replies with `replay_len`.
 - Backpressure: per-session outbound queue capped at 4 MiB; above it, stop reading the leader until below 1 MiB. With no client attached, write only to the ring and never block the process.
 
@@ -126,6 +127,7 @@ pub enum DaemonEvent {
 Rules:
 - `Attached` always carries fds via SCM_RIGHTS in order `[data, leader]`; `leader` is absent if the session already exited.
 - `Spawn` replies `Attached` with `replay_len = 0`.
+- `Spawn` with an id the daemon already has replaces it: the old session is killed with `Kill` semantics (attached or not, alive or exited), then the new shell is spawned under the same id. The app relies on this when `attach()` fails during restore, since `DaemonClient` has no `kill(id)`.
 - `Hello` must be the first frame; on version mismatch the daemon replies `HelloReject` and closes.
 
 ### 4.1 Client API (side A, `server/daemon_client.rs`, re-exported from `server/mod.rs`)
@@ -200,9 +202,9 @@ First commit: these types plus `unimplemented!()` stubs for `DaemonClient` and `
 7. Up to 10 MiB per busy session.
 
 ## 8. Tests
-Side A: round-trip of every message over a socketpair (2 fds, payloads > 1 MiB split); scanner byte-by-byte with hex Precmd/Preexec/InitShell/Bootstrapped, foreign DCS ignored, CAN abort, payload cap; ring eviction, `precmd_offsets` pruning and the three body cases; integration in a temp dir with `/bin/sh`: spawn → detach → output → attach with correct replay, Kill, `SessionExited` while attached, exited session delivered on Attach, Prune, short idle exit, second daemon exits on held lock, socket 0600 / dir 0700, `HelloReject`, 50 MB while detached without blocking the child.
+Side A: round-trip of every message over a socketpair (2 fds, payloads > 1 MiB split); scanner byte-by-byte with hex CommandFinished/Precmd/Preexec/InitShell/Bootstrapped, foreign DCS ignored, CAN abort, payload cap; ring eviction, `prompt_starts` pruning and the three body cases (starting at `CommandFinished` when present); integration in a temp dir with `/bin/sh`: spawn → detach → output → attach with correct replay, Kill, `Spawn` over an existing id replaces it, `SessionExited` while attached, exited session delivered on Attach, Prune, short idle exit, second daemon exits on held lock, socket 0600 / dir 0700, `HelloReject`, 50 MB while detached without blocking the child.
 
-Side B: event loop with a mock `EventedPty` whose replay contains `ESC[c` leaves the write queue empty and live bytes are processed afterwards; `Pty` over socketpair + openpty resizes via the leader; model test: restored `TerminalModel` + `register_session_id` + preamble + Precmd + Preexec + output → bootstrapped, running active block with that output, no bootstrap write; setting default `true` and key `general.persistent_sessions`; `prepare_for_app_termination(true)` makes `kill()` a no-op, `false` sends `Kill`.
+Side B: event loop with a mock `EventedPty` whose replay contains `ESC[c` leaves the write queue empty and live bytes are processed afterwards; `Pty` over socketpair + openpty resizes via the leader; model test: restored `TerminalModel` + `register_session_id` + preamble + CommandFinished + Precmd + Preexec + output (with both 0x9C and `ESC \` terminators) → bootstrapped, running active block with that output, no bootstrap write; setting default `true` and key `general.persistent_sessions`; `prepare_for_app_termination(true)` makes `kill()` a no-op, `false` sends `Kill`.
 
 ## Consequences
 Sessions survive quitting and app crashes. One resident process per user, exiting after 60 s idle. Closing a pane still kills its process. Persistence requires session restoration. A new protocol version does not reattach sessions from the previous one.
