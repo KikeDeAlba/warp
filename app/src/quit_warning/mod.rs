@@ -56,6 +56,8 @@ pub struct UnsavedStateSummary<'a> {
     pub shared_sessions: usize,
     /// Whether or not there are unsaved code changes.
     unsaved_code_changes: bool,
+    /// Whether quitting leaves shells running in the background.
+    sessions_keep_running: bool,
 }
 
 /// Builder for a warning dialog that displays unsaved state.
@@ -337,8 +339,11 @@ impl<'a> UnsavedStateSummary<'a> {
         let code_review_summary = CodeEditorSummary::new(&code_review_views);
 
         let num_shared_sessions = scope.shared_sessions(ctx);
+        let sessions_keep_running = matches!(scope, QuitScope::App)
+            && GeneralSettings::as_ref(ctx).should_persist_sessions();
 
         UnsavedStateSummary {
+            sessions_keep_running,
             scope,
             total_long_running_commands: sessions_summary.long_running_cmds.len(),
             windows_with_long_running_commands: sessions_summary.windows_running().len(),
@@ -425,6 +430,9 @@ impl<'a> UnsavedStateSummary<'a> {
                 );
             }
             process_info_text.push_str(scope_suffix);
+            if self.sessions_keep_running {
+                process_info_text.push_str(" They will keep running in the background.");
+            }
             info_text_lines.push(process_info_text);
         }
 
