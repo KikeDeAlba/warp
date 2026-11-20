@@ -5,6 +5,7 @@
 //! the single attached client over a per-session data socketpair.
 
 mod listener;
+mod process;
 mod ring;
 mod scanner;
 mod session;
@@ -13,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -26,21 +27,32 @@ use mio::net::{UnixListener, UnixStream};
 use nix::sys::socket;
 use signal_hook_mio::v1_0::Signals;
 
-pub(crate) use self::listener::DaemonPaths;
+pub(crate) use self::listener::{DaemonPaths, check_peer_uid};
 use self::listener::{InstanceLock, bind_socket, peer_uid};
+pub(crate) use self::process::max_fd_to_close;
+use self::process::{InheritedLimits, harden_daemon_process, with_spawn_context};
 use self::session::{Attachment, PumpOutcome, Session, observed_exit_status};
 use super::api::{
     AttachInfo, ClientMessage, DAEMON_PROTOCOL_VERSION, DaemonEvent, DaemonMessage, DaemonRequest,
-    DaemonResponse, PersistentSessionId, RING_CAPACITY, SessionMetadata,
+    DaemonResponse, PersistentSessionId, RING_CAPACITY, SessionMetadata, SpawnEnvironment,
 };
-use super::protocol::{self, FillResult, FrameReader};
+use super::protocol::{
+    self, FillResult, FlushResult, FrameReader, FrameWriter, MAX_CLIENT_FRAME_SIZE,
+};
 use crate::local_tty::{self, PtyOptions};
 
 /// Overrides the idle timeout, in seconds.
 pub(crate) const IDLE_TIMEOUT_ENV: &str = "WARP_TERMINAL_DAEMON_IDLE_SECS";
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const EXITED_SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
-const KILL_WAIT: Duration = Duration::from_millis(500);
+/// Connections that do not say `Hello` within this time are closed.
+const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+/// The maximum number of open control connections.
+const MAX_CONNECTIONS: usize = 16;
+/// The maximum number of bytes queued for one control connection.
+const MAX_CONNECTION_QUEUE: usize = 8 * 1024 * 1024;
+/// How long to wait before accepting again after running out of fds.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 /// How long the daemon keeps its copies of fds sent to a client. Closing a
 /// socket while it is still in flight over `SCM_RIGHTS` can get it flushed by
 /// the macOS unix socket garbage collector, which the receiver then sees as
@@ -60,6 +72,12 @@ pub(crate) struct DaemonConfig {
     pub idle_timeout: Duration,
     pub exited_session_ttl: Duration,
     pub ring_capacity: usize,
+    pub hello_timeout: Duration,
+    pub max_connections: usize,
+    /// The limits restored for spawned shells; `None` leaves them unchanged.
+    pub inherited_limits: Option<InheritedLimits>,
+    /// The log file that stdout and stderr point to, rotated by size.
+    pub log_file: Option<PathBuf>,
 }
 
 impl DaemonConfig {
@@ -75,6 +93,10 @@ impl DaemonConfig {
             idle_timeout,
             exited_session_ttl: EXITED_SESSION_TTL,
             ring_capacity: RING_CAPACITY,
+            hello_timeout: HELLO_TIMEOUT,
+            max_connections: MAX_CONNECTIONS,
+            inherited_limits: None,
+            log_file: None,
         }
     }
 }
@@ -95,7 +117,11 @@ pub(crate) fn run_daemon_process(
         std::process::exit(1);
     }
 
-    let daemon = match Daemon::bind(DaemonConfig::new(paths)) {
+    let inherited_limits = harden_daemon_process();
+    let mut config = DaemonConfig::new(paths.clone());
+    config.inherited_limits = inherited_limits;
+    config.log_file = Some(paths.log.clone());
+    let daemon = match Daemon::bind(config) {
         Ok(Some(daemon)) => daemon,
         Ok(None) => std::process::exit(0),
         Err(err) => {
@@ -162,6 +188,34 @@ fn daemonize(log_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Moves the log aside once it exceeds `max_size` and points `targets` at a
+/// fresh file. Returns whether it rotated.
+fn rotate_log(path: &Path, max_size: u64, targets: &[RawFd]) -> Result<bool> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.len() <= max_size => return Ok(false),
+        Ok(_) => {
+            let mut old = path.as_os_str().to_owned();
+            old.push(".old");
+            std::fs::rename(path, &old).context("Failed to move the log aside")?;
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err).context("Failed to inspect the log"),
+    }
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+        .context("Failed to open a new log")?;
+    for target in targets {
+        // SAFETY: both fds are valid.
+        if unsafe { libc::dup2(log.as_raw_fd(), *target) } < 0 {
+            return Err(std::io::Error::last_os_error()).context("dup2 failed");
+        }
+    }
+    Ok(true)
+}
+
 struct StderrLogger;
 
 impl log::Log for StderrLogger {
@@ -193,7 +247,38 @@ enum Source {
 struct Connection {
     stream: UnixStream,
     reader: FrameReader,
+    writer: FrameWriter,
     said_hello: bool,
+    accepted_at: Instant,
+    /// Close once the outbound queue is flushed.
+    closing: bool,
+}
+
+/// Serializes fd-creating and forking operations of daemons that run on test
+/// threads, so a shell spawned for one test never inherits another test's
+/// fds in the window before they are marked close-on-exec.
+#[cfg(test)]
+pub(crate) static TEST_FORK_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+#[cfg(test)]
+fn fork_guard() -> Option<parking_lot::MutexGuard<'static, ()>> {
+    Some(TEST_FORK_LOCK.lock())
+}
+
+#[cfg(not(test))]
+fn fork_guard() -> Option<()> {
+    None
+}
+
+/// Observations of the event loop that tests wait on instead of sleeping.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct TestStats {
+    /// How many times a session paused reading its PTY for backpressure.
+    pub pauses: std::sync::atomic::AtomicU64,
+    /// Since when the daemon had sessions but no client, and when it last
+    /// checked that.
+    pub unattended: parking_lot::Mutex<Option<(Instant, Instant)>>,
 }
 
 /// Stops a running daemon from another thread.
@@ -202,6 +287,7 @@ struct Connection {
 pub(crate) struct StopHandle {
     stop: Arc<AtomicBool>,
     waker: Arc<mio::Waker>,
+    pub stats: Arc<TestStats>,
 }
 
 #[cfg(test)]
@@ -229,7 +315,11 @@ pub(crate) struct Daemon {
     orphans: Vec<std::process::Child>,
     in_flight: Vec<InFlightFds>,
     ready: HashSet<PersistentSessionId>,
+    ready_connections: HashSet<mio::Token>,
+    accept_backoff_until: Option<Instant>,
     idle_since: Option<Instant>,
+    #[cfg(test)]
+    stats: Arc<TestStats>,
 }
 
 /// Copies of fds sent to a client, kept open for [`IN_FLIGHT_FD_GRACE`].
@@ -271,7 +361,11 @@ impl Daemon {
             orphans: Vec::new(),
             in_flight: Vec::new(),
             ready: HashSet::new(),
+            ready_connections: HashSet::new(),
+            accept_backoff_until: None,
             idle_since: None,
+            #[cfg(test)]
+            stats: Arc::new(TestStats::default()),
         }))
     }
 
@@ -280,6 +374,7 @@ impl Daemon {
         StopHandle {
             stop: self.stop.clone(),
             waker: self.waker.clone(),
+            stats: self.stats.clone(),
         }
     }
 
@@ -289,12 +384,16 @@ impl Daemon {
         let mut last_tick = Instant::now();
         self.idle_since = Some(Instant::now());
         loop {
-            let timeout = if self.ready.is_empty() {
+            let timeout = if self.ready.is_empty() && self.ready_connections.is_empty() {
                 let idle_left = self
                     .idle_since
                     .map(|since| self.config.idle_timeout.saturating_sub(since.elapsed()))
                     .unwrap_or(TICK);
-                TICK.min(idle_left)
+                let backoff_left = self
+                    .accept_backoff_until
+                    .map(|until| until.saturating_duration_since(Instant::now()))
+                    .unwrap_or(TICK);
+                TICK.min(idle_left).min(backoff_left)
             } else {
                 Duration::ZERO
             };
@@ -315,7 +414,7 @@ impl Daemon {
                     }
                     WAKER_TOKEN => {}
                     token if self.connections.contains_key(&token) => {
-                        self.on_connection_readable(token)
+                        self.on_connection_event(token)
                     }
                     token => match self.sources.get(&token) {
                         Some(Source::Leader(id) | Source::Data(id)) => {
@@ -330,6 +429,16 @@ impl Daemon {
             for id in std::mem::take(&mut self.ready) {
                 self.pump(id);
             }
+            for token in std::mem::take(&mut self.ready_connections) {
+                self.on_connection_event(token);
+            }
+            if self
+                .accept_backoff_until
+                .is_some_and(|until| Instant::now() >= until)
+            {
+                self.accept_backoff_until = None;
+                self.accept_connections();
+            }
 
             if self.stop.load(Ordering::SeqCst) {
                 break;
@@ -341,6 +450,28 @@ impl Daemon {
                 self.expire_exited_sessions();
                 self.in_flight
                     .retain(|entry| entry.sent_at.elapsed() < IN_FLIGHT_FD_GRACE);
+                self.close_silent_connections();
+                if let Some(log) = &self.config.log_file
+                    && let Err(err) = rotate_log(
+                        log,
+                        MAX_LOG_SIZE,
+                        &[libc::STDOUT_FILENO, libc::STDERR_FILENO],
+                    )
+                {
+                    log::warn!("Failed to rotate the log: {err:#}");
+                }
+            }
+
+            #[cfg(test)]
+            {
+                let mut unattended = self.stats.unattended.lock();
+                if self.connections.is_empty() && !self.sessions.is_empty() {
+                    let now = Instant::now();
+                    let since = unattended.map_or(now, |(since, _)| since);
+                    *unattended = Some((since, now));
+                } else {
+                    *unattended = None;
+                }
             }
 
             if self.sessions.is_empty() && self.connections.is_empty() {
@@ -362,6 +493,9 @@ impl Daemon {
         token
     }
 
+    /// Accepts every pending connection. The listener is edge-triggered, so
+    /// on a transient error (such as running out of fds) accepting is retried
+    /// after [`ACCEPT_BACKOFF`] instead of waiting for the next connection.
     fn accept_connections(&mut self) {
         loop {
             match self.listener.accept() {
@@ -374,12 +508,16 @@ impl Daemon {
                             continue;
                         }
                     }
+                    if self.connections.len() >= self.config.max_connections {
+                        log::warn!("Rejected connection: too many open connections");
+                        continue;
+                    }
                     let token = self.allocate_token();
-                    if let Err(err) =
-                        self.poll
-                            .registry()
-                            .register(&mut stream, token, Interest::READABLE)
-                    {
+                    if let Err(err) = self.poll.registry().register(
+                        &mut stream,
+                        token,
+                        Interest::READABLE | Interest::WRITABLE,
+                    ) {
                         log::warn!("Failed to register connection: {err}");
                         continue;
                     }
@@ -387,27 +525,86 @@ impl Daemon {
                         token,
                         Connection {
                             stream,
-                            reader: FrameReader::new(),
+                            reader: FrameReader::with_max_frame_size(MAX_CLIENT_FRAME_SIZE),
+                            writer: FrameWriter::new(MAX_CONNECTION_QUEUE),
                             said_hello: false,
+                            accepted_at: Instant::now(),
+                            closing: false,
                         },
                     );
                     // Data may have arrived before registration.
-                    self.on_connection_readable(token);
+                    self.on_connection_event(token);
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return,
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(err) if err.kind() == std::io::ErrorKind::ConnectionAborted => continue,
                 Err(err) => {
-                    log::warn!("Failed to accept connection: {err}");
+                    log::warn!("Failed to accept connection: {err}; retrying shortly");
+                    self.accept_backoff_until = Some(Instant::now() + ACCEPT_BACKOFF);
                     return;
                 }
             }
         }
     }
 
-    fn on_connection_readable(&mut self, token: mio::Token) {
+    /// Closes connections that did not say `Hello` in time.
+    fn close_silent_connections(&mut self) {
+        let timeout = self.config.hello_timeout;
+        let silent: Vec<_> = self
+            .connections
+            .iter()
+            .filter(|(_, connection)| {
+                !connection.said_hello && connection.accepted_at.elapsed() >= timeout
+            })
+            .map(|(token, _)| *token)
+            .collect();
+        for token in silent {
+            log::warn!("Closing a connection that did not say hello in time");
+            self.close_connection(token);
+        }
+    }
+
+    /// Writes queued frames and reads new ones. Returns whether the connection
+    /// is still open.
+    fn flush_connection(&mut self, token: mio::Token) -> bool {
+        let Some(connection) = self.connections.get_mut(&token) else {
+            return false;
+        };
+        let mut sent_fds = Vec::new();
+        let result = connection
+            .writer
+            .flush(connection.stream.as_raw_fd(), &mut sent_fds);
+        let closing = connection.closing && connection.writer.is_empty();
+        if !sent_fds.is_empty() {
+            self.in_flight.push(InFlightFds {
+                sent_at: Instant::now(),
+                _fds: sent_fds,
+            });
+        }
+        match result {
+            Ok(_) if closing => {
+                self.close_connection(token);
+                false
+            }
+            Ok(FlushResult::Done | FlushResult::WouldBlock) => true,
+            Err(err) => {
+                log::warn!("Failed to send message to client: {err:#}");
+                self.close_connection(token);
+                false
+            }
+        }
+    }
+
+    fn on_connection_event(&mut self, token: mio::Token) {
+        if !self.flush_connection(token) {
+            return;
+        }
         let Some(connection) = self.connections.get_mut(&token) else {
             return;
         };
+        if connection.closing {
+            return;
+        }
         let fill = connection.reader.fill(connection.stream.as_raw_fd());
         let mut messages = Vec::new();
         let mut broken = false;
@@ -423,13 +620,26 @@ impl Daemon {
             }
         }
         for message in messages {
-            if !self.connections.contains_key(&token) {
+            if self
+                .connections
+                .get(&token)
+                .is_none_or(|connection| connection.closing)
+            {
                 return;
             }
             self.handle_message(token, message);
         }
-        if broken || !matches!(fill, Ok(FillResult::WouldBlock)) {
-            self.close_connection(token);
+        match fill {
+            _ if broken => self.close_connection(token),
+            Ok(FillResult::WouldBlock) => {}
+            Ok(FillResult::Budget) => {
+                self.ready_connections.insert(token);
+            }
+            Ok(FillResult::Closed) => self.close_connection(token),
+            Err(err) => {
+                log::warn!("Failed to read from client: {err:#}");
+                self.close_connection(token);
+            }
         }
     }
 
@@ -438,20 +648,34 @@ impl Daemon {
             return;
         };
         let _ = self.poll.registry().deregister(&mut connection.stream);
+        self.ready_connections.remove(&token);
         if self.active == Some(token) {
             self.active = None;
             self.detach_all();
         }
     }
 
-    fn send(&mut self, token: mio::Token, message: &DaemonMessage, fds: &[RawFd]) {
-        let Some(connection) = self.connections.get(&token) else {
+    /// Queues `message` for the client and writes as much as the socket
+    /// accepts without blocking; the rest is written when it becomes
+    /// writable. A client whose queue overflows is dropped.
+    fn send(&mut self, token: mio::Token, message: &DaemonMessage, fds: Vec<OwnedFd>) {
+        let Some(connection) = self.connections.get_mut(&token) else {
             return;
         };
-        if let Err(err) = protocol::send_frame(connection.stream.as_raw_fd(), message, fds) {
-            log::warn!("Failed to send message to client: {err:#}");
+        if let Err(err) = connection.writer.push(message, fds) {
+            log::warn!("Failed to queue message for client: {err:#}");
             self.close_connection(token);
+            return;
         }
+        self.flush_connection(token);
+    }
+
+    /// Sends `message` and closes the connection once it is written.
+    fn send_and_close(&mut self, token: mio::Token, message: &DaemonMessage) {
+        if let Some(connection) = self.connections.get_mut(&token) {
+            connection.closing = true;
+        }
+        self.send(token, message, Vec::new());
     }
 
     fn handle_message(&mut self, token: mio::Token, message: ClientMessage) {
@@ -473,7 +697,7 @@ impl Daemon {
                     log::warn!(
                         "Rejecting client {client_pid} with protocol version {protocol_version}"
                     );
-                    self.send(
+                    self.send_and_close(
                         token,
                         &DaemonMessage::HelloReject {
                             protocol_version: DAEMON_PROTOCOL_VERSION,
@@ -481,9 +705,7 @@ impl Daemon {
                                 "unsupported protocol version {protocol_version}; expected {DAEMON_PROTOCOL_VERSION}"
                             ),
                         },
-                        &[],
                     );
-                    self.close_connection(token);
                     return;
                 }
                 if let Some(previous) = self.active.filter(|previous| *previous != token) {
@@ -500,7 +722,7 @@ impl Daemon {
                         protocol_version: DAEMON_PROTOCOL_VERSION,
                         daemon_pid: std::process::id(),
                     },
-                    &[],
+                    Vec::new(),
                 );
             }
             ClientMessage::Request { .. } if !said_hello => self.close_connection(token),
@@ -509,21 +731,14 @@ impl Daemon {
                 request,
             } => {
                 let (response, fds) = self.handle_request(request);
-                let raw_fds: Vec<RawFd> = fds.iter().map(|fd| fd.as_raw_fd()).collect();
                 self.send(
                     token,
                     &DaemonMessage::Response {
                         request_id,
                         response,
                     },
-                    &raw_fds,
+                    fds,
                 );
-                if !fds.is_empty() {
-                    self.in_flight.push(InFlightFds {
-                        sent_at: Instant::now(),
-                        _fds: fds,
-                    });
-                }
             }
         }
     }
@@ -538,7 +753,8 @@ impl Daemon {
                 session_id,
                 metadata,
                 options,
-            } => match self.spawn_session(session_id, metadata, *options) {
+                environment,
+            } => match self.spawn_session(session_id, metadata, *options, environment) {
                 Ok(()) => self.attach_session(session_id, false),
                 Err(err) => (DaemonResponse::Error(format!("{err:#}")), Vec::new()),
             },
@@ -572,13 +788,27 @@ impl Daemon {
         id: PersistentSessionId,
         metadata: SessionMetadata,
         mut options: PtyOptions,
+        environment: Option<SpawnEnvironment>,
     ) -> Result<()> {
         if self.sessions.contains_key(&id) {
             log::info!("Replacing an existing session on spawn");
             self.kill_session(id);
         }
         options.close_fds = true;
-        let info = local_tty::spawn(options)?;
+        let limits = self.config.inherited_limits;
+        let spawn = |limits| {
+            let _guard = fork_guard();
+            with_spawn_context(environment.as_ref(), limits, || {
+                local_tty::spawn(options.clone())
+            })
+        };
+        let info = match spawn(limits) {
+            Err(err) if limits.is_some() => {
+                log::warn!("Spawn with the inherited limits failed ({err:#}); retrying");
+                spawn(None)?
+            }
+            result => result?,
+        };
         // SAFETY: the spawn result transfers ownership of the leader fd.
         let leader = unsafe { OwnedFd::from_raw_fd(info.result.leader_fd) };
         protocol::set_nonblocking(leader.as_raw_fd())?;
@@ -622,21 +852,25 @@ impl Daemon {
         }
         self.detach_session(id);
 
-        let (daemon_end, app_end) = socket::socketpair(
-            socket::AddressFamily::Unix,
-            socket::SockType::Stream,
-            None,
-            socket::SockFlag::empty(),
-        )?;
-        // SAFETY: socketpair returned two fresh fds that we now own.
-        let (daemon_end, app_end) = unsafe {
-            (
-                OwnedFd::from_raw_fd(daemon_end),
-                OwnedFd::from_raw_fd(app_end),
-            )
+        let (daemon_end, app_end) = {
+            let _guard = fork_guard();
+            let (daemon_end, app_end) = socket::socketpair(
+                socket::AddressFamily::Unix,
+                socket::SockType::Stream,
+                None,
+                socketpair_flags(),
+            )?;
+            // SAFETY: socketpair returned two fresh fds that we now own.
+            let (daemon_end, app_end) = unsafe {
+                (
+                    OwnedFd::from_raw_fd(daemon_end),
+                    OwnedFd::from_raw_fd(app_end),
+                )
+            };
+            protocol::set_cloexec(daemon_end.as_raw_fd())?;
+            protocol::set_cloexec(app_end.as_raw_fd())?;
+            (daemon_end, app_end)
         };
-        protocol::set_cloexec(daemon_end.as_raw_fd())?;
-        protocol::set_cloexec(app_end.as_raw_fd())?;
         protocol::set_nonblocking(daemon_end.as_raw_fd())?;
 
         let token = self.allocate_token();
@@ -663,7 +897,10 @@ impl Daemon {
 
         let mut fds = vec![app_end];
         if let Some(leader) = &session.leader {
-            fds.push(leader.try_clone()?);
+            let _guard = fork_guard();
+            let leader = leader.try_clone()?;
+            protocol::set_cloexec(leader.as_raw_fd())?;
+            fds.push(leader);
         }
         let info = AttachInfo {
             session_id: id,
@@ -707,7 +944,8 @@ impl Daemon {
         }
     }
 
-    /// Removes a session and kills its process.
+    /// Removes a session and sends SIGKILL to its process without waiting;
+    /// the process is reaped on SIGCHLD.
     fn kill_session(&mut self, id: PersistentSessionId) {
         let Some(mut session) = self.remove_session(id) else {
             return;
@@ -716,15 +954,9 @@ impl Daemon {
             return;
         };
         let _ = child.kill();
-        let deadline = Instant::now() + KILL_WAIT;
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) | Err(_) => return,
-                Ok(None) if Instant::now() >= deadline => break,
-                Ok(None) => std::thread::sleep(Duration::from_millis(5)),
-            }
+        if !matches!(child.try_wait(), Ok(Some(_)) | Err(_)) {
+            self.orphans.push(child);
         }
-        self.orphans.push(child);
     }
 
     /// Removes a session, closing its leader and data socket.
@@ -744,7 +976,14 @@ impl Daemon {
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
-        match session.pump(self.poll.registry()) {
+        let outcome = session.pump(self.poll.registry());
+        #[cfg(test)]
+        if session.is_paused() {
+            self.stats
+                .pauses
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        match outcome {
             PumpOutcome::Idle => {}
             PumpOutcome::MoreWork => {
                 self.ready.insert(id);
@@ -764,7 +1003,7 @@ impl Daemon {
                             pid: session.pid,
                             status,
                         }),
-                        &[],
+                        Vec::new(),
                     );
                 }
             }
@@ -823,6 +1062,16 @@ impl Daemon {
             self.remove_session(id);
         }
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn socketpair_flags() -> socket::SockFlag {
+    socket::SockFlag::SOCK_CLOEXEC
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn socketpair_flags() -> socket::SockFlag {
+    socket::SockFlag::empty()
 }
 
 impl Drop for Daemon {

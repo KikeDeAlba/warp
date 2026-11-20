@@ -23,25 +23,31 @@ Other facts this design relies on:
 Rejected: handing only the PTY fd and reading in the daemon while detached (incomplete ring, a crash loses the running block); replay over the control channel (framing cannot carry MBs, small macOS socket buffers); suppressing replies inside `pty_read` by byte counting (chunks mix replay and live bytes).
 
 ## 1. Transport
-- Directory: `warp_core::paths::state_dir().join("ts")` (`crates/warp_core/src/paths.rs:260`), mode 0700 (reuse/copy `ensure_private_daemon_dir`, `app/src/remote_server/unix/proxy.rs:88`). Files: `v{DAEMON_PROTOCOL_VERSION}.sock`, `.lock`, `.log`. If the socket path exceeds 100 bytes, use `$TMPDIR/warp-ts-<uid>/` (0700).
-- `umask(0o077)` before `bind`, then `chmod 0600`. On accept, compare the peer uid with `geteuid()` (`getpeereid` on macOS, `SO_PEERCRED` on Linux); close silently on mismatch.
+- Directory: `warp_core::paths::state_dir().join("ts")` (`crates/warp_core/src/paths.rs:260`). Files: `v{DAEMON_PROTOCOL_VERSION}.sock`, `.lock`, `.log`. If the socket path exceeds 100 bytes, fall back to `$XDG_RUNTIME_DIR/warp-ts/` (Linux, when set and absolute), else `$TMPDIR/warp-ts-<uid>/`, else `/tmp/warp-ts-<uid>/`.
+- The directory is created with `DirBuilder::mode(0o700)` (never world-readable, not even briefly) and must be a real directory (not a symlink) owned by `geteuid()`. `connect_or_spawn` and the daemon tighten an existing one we own to 0700; `connect_existing` only validates it (missing → no daemon; symlink, other owner or group/other bits → error) and never creates it.
+- `umask(0o077)` before `bind`, then `chmod 0600`. Both ends check the peer uid against `geteuid()` (`getpeereid` on macOS, `SO_PEERCRED` on Linux): the daemon on accept (close silently on mismatch) and the client right after `connect`, before sending `Hello` (error on mismatch), so neither side talks to another user's process even if the socket path was planted.
 - Framing: the `protocol.rs` format (BE `usize` header + bincode + SCM_RIGHTS), generalized: `send_frame<T: Serialize>(fd, &T, fds: &[RawFd])`, `cmsg_space!([RawFd; 2])`, a blocking reader that loops until `payload_size`, and a non-blocking `FrameReader` on the daemon side that accumulates bytes and fds. Legacy `api::Message` stays intact.
 - One full-duplex control connection; responses correlate by `request_id`; a client reader thread dispatches responses and events.
+- The daemon never blocks on a client: every frame it sends goes through a per-connection outbound queue (`FrameWriter`, 8 MiB cap) written when the socket is writable; a client whose queue overflows is dropped. Fds attached to a frame stay open for 5 s after their first byte is written (macOS in-flight fd GC).
+- Limits on the control socket: frames from a client are capped at 4 MiB (frames from the daemon at 64 MiB); each read pass takes at most 256 KiB per connection before yielding to the event loop; at most 16 concurrent connections; a connection must send `Hello` within 5 s or it is closed.
+- Received fds are close-on-exec immediately: `MSG_CMSG_CLOEXEC` on Linux, `FD_CLOEXEC` right after `recvmsg` on macOS. Daemon socketpairs use `SOCK_CLOEXEC` on Linux.
 - Single client: a valid `Hello` evicts the previous client (equivalent to a detach for it).
 
 ## 2. Daemon lifecycle
 - CLI: `warp_cli::TerminalServerArgs` (`crates/warp_cli/src/lib.rs:734`) gains `#[clap(long)] pub daemon: bool`; `--parent-pid` is not required in daemon mode. `run_terminal_server` dispatches on the flag.
-- Startup with `--daemon`, before any thread: double fork (`_exit(0)` in the parent), `setsid()`, `SIGHUP` → `SIG_IGN`, `umask(0o077)`, `chdir("/")`, stdin → `/dev/null`, stdout/stderr → `v{N}.log` (append; truncate at start if > 5 MB), `flock(v{N}.lock, LOCK_EX|LOCK_NB)` (on failure `exit(0)`; held for life), unlink stale socket, `bind`, `listen`, file logger, `init_platform()` and feature flags as today.
-- Connect-or-spawn (client): `connect` + `Hello`; on `ENOENT`/`ECONNREFUSED` run `current_exe() <terminal-server subcommand> --daemon` with null stdio and fds ≥ 3 closed in `pre_exec`, `wait()` the short-lived child, retry `connect` every 50 ms up to 3 s. The daemon's flock serializes races.
+- Startup with `--daemon`, before any thread: double fork (`_exit(0)` in the parent), `setsid()`, `SIGHUP` → `SIG_IGN`, `umask(0o077)`, `chdir("/")`, stdin → `/dev/null`, stdout/stderr → `v{N}.log` (append; truncate at start if > 5 MB), then hardening: `RLIMIT_NOFILE` soft raised to the hard limit (capped at 10240), `RLIMIT_CORE` soft = 0, and on Linux `prctl(PR_SET_DUMPABLE, 0)`; then `flock(v{N}.lock, LOCK_EX|LOCK_NB)` (on failure `exit(0)`; held for life), unlink stale socket, `bind`, `listen`, file logger, `init_platform()` and feature flags as today.
+- Log rotation while running: every tick, if `v{N}.log` exceeds 5 MB it is renamed to `v{N}.log.old` and stdout/stderr are pointed at a fresh file.
+- Connect-or-spawn (client): `connect` + peer uid check + `Hello`; on `ENOENT`/`ECONNREFUSED`, or `EPIPE`/`ECONNRESET`/EOF during the handshake (a daemon that is idle-exiting), run `current_exe() <terminal-server subcommand> --daemon` with null stdio and fds ≥ 3 closed in `pre_exec` (up to the soft `RLIMIT_NOFILE`, capped at 10240; never `sysconf`, which can be -1 or huge), `wait()` the short-lived child, retry `connect` every 50 ms up to 3 s. The daemon's flock serializes races.
 - Shells are spawned with `local_tty::spawn` and `close_fds = true`; all daemon fds are `CLOEXEC`. `pre_exec` already resets signal dispositions (`unix.rs:502-521`).
+- Spawn context: the daemon must not hand shells its own stale state (the environment of whichever app launched it, its `/` cwd, its raised and hardened limits). `Spawn` carries a `SpawnEnvironment { vars, cwd }` captured by the client (`std::env::vars_os()`, lossless `OsString`s, plus `current_dir()`). For the duration of `local_tty::spawn` the single-threaded daemon replaces its process environment with exactly `vars` (so `env_clear()` + client env; `unix.rs` then applies its Warp overlay and `PtyOptions::env_vars` on top, as in the legacy path), switches its cwd to the client's cwd, and restores the inherited soft `RLIMIT_NOFILE` and `RLIMIT_CORE`; everything is restored afterwards. The shell's initial directory is `start_dir`, else the client's `$HOME` (same as the legacy path), never the daemon's `/`. If a spawn with the inherited fd limit fails (the daemon may be using fds above it), it is retried once with the raised limit. Variables that cannot be set (empty key, `=` or NUL) are skipped. `PR_SET_DUMPABLE` is reset by `execve`.
 - Idle exit: no sessions (alive or exited-pending) and no client for 60 s (overridable by env var for tests).
 - Control EOF from the app = detach all its sessions; nothing is killed.
-- `Kill`: close the leader, SIGKILL the pid, `waitpid(WNOHANG)` up to 500 ms, reply `Done`; SIGCHLD reaps the rest.
+- `Kill`: close the leader, SIGKILL the pid, one `waitpid(WNOHANG)`, reply `Done` right away; SIGCHLD reaps it. The event loop never sleeps or blocks on a single client or process.
 - Shell exit: drain the leader until `EIO`/`EAGAIN`. If attached: `shutdown(SHUT_WR)` on data, emit `SessionExited`, drop the session. If detached: keep `Exited{status}` + ring until the next `Attach` (delivered, then dropped), `Prune`, or 24 h.
 
 ## 3. Ring buffer and replay (daemon)
 - `RING_CAPACITY = 10 MiB` per session, lazily grown, absolute offsets (`total: u64`, `ring_start = total - len`).
-- Incremental DCS scanner: `ESC P $` + `d|f` + payload + `ESC \` (or 0x9C; CAN/SUB abort), payload capped at 1 MiB, tolerant of splits across reads. For `d`, hex-decode and parse only `{hook, value.session_id, value.is_subshell}`:
+- Incremental DCS scanner: `ESC P $` + `d|f` + payload + `ESC \` (or 0x9C; CAN/SUB abort), payload capped at 8 MiB (a warning is logged when a hook is dropped for size), tolerant of splits across reads. Sizing: the largest hook, `Bootstrapped`, carries aliases, function names, builtins, keywords, `setopt` and exported variable names; a measured zsh setup sends about 16 KiB of JSON (32 KiB hex), and heavy plugin setups a few hundred KiB. For `d`, hex-decode and parse only `{hook, value.session_id, value.is_subshell}`. `CommandFinished`, `Precmd` and `Preexec` count only when `session_id` equals the session's `hook_session_id`; hooks from warpified subshells or SSH sessions (other ids) or without an id never move `replay_from`:
   - `CommandFinished`: keep it as pending (`last_command_finished_raw`); a `Preexec` clears a pending one.
   - `Precmd`: a prompt starts at the pending `CommandFinished` (if any, it is consumed) or else at the `Precmd` itself. Record that start offset in `prompt_starts` (pruned on eviction) and keep `last_command_finished_raw` + `last_precmd_raw` for the last prompt.
   - `Preexec`: keep `last_preexec_raw`.
@@ -68,6 +74,12 @@ pub struct SessionMetadata {
     pub shell_type: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpawnEnvironment {
+    pub vars: Vec<(OsString, OsString)>,
+    pub cwd: Option<OsString>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientMessage {
     Hello { protocol_version: u32, client_pid: u32, app_version: Option<String> },
@@ -77,7 +89,7 @@ pub enum ClientMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DaemonRequest {
     List,
-    Spawn { session_id: PersistentSessionId, metadata: SessionMetadata, options: Box<PtyOptions> },
+    Spawn { session_id: PersistentSessionId, metadata: SessionMetadata, options: Box<PtyOptions>, environment: Option<SpawnEnvironment> },
     Attach { session_id: PersistentSessionId },
     Kill { session_id: PersistentSessionId },
     Prune { keep: Vec<PersistentSessionId> },
@@ -126,7 +138,7 @@ pub enum DaemonEvent {
 ```
 Rules:
 - `Attached` always carries fds via SCM_RIGHTS in order `[data, leader]`; `leader` is absent if the session already exited.
-- `Spawn` replies `Attached` with `replay_len = 0`.
+- `Spawn` replies `Attached` with `replay_len = 0`. `DaemonClient::spawn` always sends `environment: Some(SpawnEnvironment::capture())`; `None` keeps the daemon's own environment (tests only).
 - `Spawn` with an id the daemon already has replaces it: the old session is killed with `Kill` semantics (attached or not, alive or exited), then the new shell is spawned under the same id. The app relies on this when `attach()` fails during restore, since `DaemonClient` has no `kill(id)`.
 - `Hello` must be the first frame; on version mismatch the daemon replies `HelloReject` and closes.
 
@@ -191,6 +203,12 @@ First commit: these types plus `unimplemented!()` stubs for `DaemonClient` and `
 | `HelloReject` | Same as above; the old daemon is left running with its sessions (documented limitation). |
 | Daemon dies | Panes end as `Unavailable`; the next new pane retries `connect_or_spawn` once. |
 | AppImage (`APPIMAGE` set) | Feature disabled (binary unmount can SIGBUS the daemon). |
+
+## 6.1 Threat model
+- Trust boundary: the user account. Any process running as the same uid can connect to the socket, list, attach to, write into and kill every persistent session, and read its scrollback. This is an accepted risk, the same as tmux, screen and similar multiplexer servers: such a process can already `ptrace` the user's shells (where permitted) or read their files.
+- Other users are kept out: the directory is 0700 and owned by the user (not a symlink), the socket is 0600, and both the daemon and the client enforce the peer uid; the client never sends anything to a daemon owned by another uid.
+- Scrollback lives only in daemon memory (10 MiB ring per session): nothing is written to disk. Core dumps are disabled (`RLIMIT_CORE` = 0) and on Linux the daemon is non-dumpable, so its memory is not exposed through core files or same-uid `ptrace`/`/proc/<pid>/mem`. The log records lifecycle events only, never terminal bytes.
+- Resource abuse by a same-uid client is bounded (frame size, per-read budget, connection count, `Hello` timeout, outbound queue) so a misbehaving client cannot stall or exhaust the daemon for the app.
 
 ## 7. Risks
 1. Rebuilt bootstrap: the preamble moves the model from `WarpInput` straight to `Bootstrapped` and the replayed hook triggers follow-up events. Side B validates this with a model test first; plan B is `set_bootstrapped()` plus a synthetic `Sessions` entry.

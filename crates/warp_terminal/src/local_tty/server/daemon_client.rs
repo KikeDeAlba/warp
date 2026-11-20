@@ -15,9 +15,9 @@ use warp_errors::report_error;
 
 use super::api::{
     AttachInfo, ClientMessage, DAEMON_PROTOCOL_VERSION, DaemonEvent, DaemonMessage, DaemonRequest,
-    DaemonResponse, PersistentSessionId, SessionMetadata, SessionSummary,
+    DaemonResponse, PersistentSessionId, SessionMetadata, SessionSummary, SpawnEnvironment,
 };
-use super::daemon::DaemonPaths;
+use super::daemon::{DaemonPaths, check_peer_uid, max_fd_to_close};
 use super::protocol;
 use crate::event::ObservedExitStatus;
 use crate::local_tty::PtyOptions;
@@ -54,6 +54,14 @@ impl Shared {
 
     fn request(&self, request: DaemonRequest, timeout: Duration) -> Result<PendingResponse> {
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let message = ClientMessage::Request {
+            request_id,
+            request,
+        };
+        let size = bincode::serialized_size(&message).context("Failed to size request")?;
+        if size > protocol::MAX_CLIENT_FRAME_SIZE as u64 {
+            bail!("terminal daemon request is too large ({size} bytes)");
+        }
         let (sender, receiver) = mpsc::channel();
         match self.pending.lock().as_mut() {
             Some(pending) => {
@@ -63,14 +71,7 @@ impl Shared {
         }
         let sent = {
             let _guard = self.write_lock.lock();
-            protocol::send_frame(
-                self.socket.as_raw_fd(),
-                &ClientMessage::Request {
-                    request_id,
-                    request,
-                },
-                &[],
-            )
+            protocol::send_frame(self.socket.as_raw_fd(), &message, &[])
         };
         if let Err(err) = sent {
             if let Some(pending) = self.pending.lock().as_mut() {
@@ -145,6 +146,17 @@ impl Shared {
     }
 }
 
+/// Returns whether reading the peer credentials failed because the daemon
+/// already closed the connection (macOS reports `EINVAL` then).
+fn peer_is_gone(err: &anyhow::Error) -> bool {
+    protocol::is_disconnect(err)
+        || err.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.raw_os_error() == Some(libc::EINVAL))
+        })
+}
+
 /// Sends SIGCHLD to the current process so pty event loops check whether
 /// their child exited.
 fn raise_sigchld() {
@@ -216,7 +228,11 @@ impl DaemonClient {
 
     /// Connects to the daemon only if it is already running.
     pub fn connect_existing() -> anyhow::Result<Option<Arc<Self>>> {
-        Self::connect_at(&DaemonPaths::default_for_user().socket)
+        let paths = DaemonPaths::default_for_user();
+        if !paths.validate_private_dir()? {
+            return Ok(None);
+        }
+        Self::connect_at(&paths.socket)
     }
 
     pub(crate) fn connect_or_spawn_with(
@@ -254,8 +270,23 @@ impl DaemonClient {
             }
             Err(err) => return Err(err).context("Failed to connect to terminal daemon"),
         };
-        stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
-        protocol::send_frame(
+        match check_peer_uid(stream.as_raw_fd(), nix::unistd::geteuid().as_raw()) {
+            Ok(()) => {}
+            Err(err) if peer_is_gone(&err) => return Ok(None),
+            Err(err) => {
+                return Err(
+                    err.context("Refusing to talk to a terminal daemon owned by another user")
+                );
+            }
+        }
+        if let Err(err) = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT)) {
+            let err = anyhow::Error::new(err);
+            if peer_is_gone(&err) {
+                return Ok(None);
+            }
+            return Err(err.context("Failed to configure the terminal daemon socket"));
+        }
+        let hello = protocol::send_frame(
             stream.as_raw_fd(),
             &ClientMessage::Hello {
                 protocol_version: DAEMON_PROTOCOL_VERSION,
@@ -263,8 +294,12 @@ impl DaemonClient {
                 app_version: warp_core::channel::ChannelState::app_version().map(str::to_owned),
             },
             &[],
-        )
-        .context("Failed to send hello to terminal daemon")?;
+        );
+        match hello {
+            Ok(()) => {}
+            Err(err) if protocol::is_disconnect(&err) => return Ok(None),
+            Err(err) => return Err(err.context("Failed to send hello to terminal daemon")),
+        }
         match protocol::receive_frame::<DaemonMessage>(stream.as_raw_fd()) {
             Ok(Some((DaemonMessage::HelloAck { .. }, _))) => {}
             Ok(Some((
@@ -276,9 +311,16 @@ impl DaemonClient {
             ))) => bail!("terminal daemon (protocol {protocol_version}) rejected client: {reason}"),
             Ok(Some((other, _))) => bail!("unexpected handshake reply: {other:?}"),
             Ok(None) => return Ok(None),
+            Err(err) if protocol::is_disconnect(&err) => return Ok(None),
             Err(err) => return Err(err.context("Terminal daemon handshake failed")),
         };
-        stream.set_read_timeout(None)?;
+        if let Err(err) = stream.set_read_timeout(None) {
+            let err = anyhow::Error::new(err);
+            if peer_is_gone(&err) {
+                return Ok(None);
+            }
+            return Err(err.context("Failed to configure the terminal daemon socket"));
+        }
 
         let shared = Arc::new(Shared {
             socket: OwnedFd::from(stream),
@@ -314,11 +356,24 @@ impl DaemonClient {
         metadata: SessionMetadata,
         options: PtyOptions,
     ) -> anyhow::Result<AttachedSession> {
+        self.spawn_with_environment(id, metadata, options, SpawnEnvironment::capture())
+    }
+
+    /// Spawns a session whose shell starts from `environment` instead of the
+    /// current process environment.
+    pub(crate) fn spawn_with_environment(
+        &self,
+        id: PersistentSessionId,
+        metadata: SessionMetadata,
+        options: PtyOptions,
+        environment: SpawnEnvironment,
+    ) -> anyhow::Result<AttachedSession> {
         let response = self.shared.request(
             DaemonRequest::Spawn {
                 session_id: id,
                 metadata,
                 options: Box::new(options),
+                environment: Some(environment),
             },
             REQUEST_TIMEOUT,
         )?;
@@ -422,9 +477,9 @@ fn spawn_daemon_command(program: &PathBuf) -> Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    let fd_limit = max_fd_to_close();
     // SAFETY: the closure only calls async-signal-safe functions.
     unsafe {
-        let fd_limit = libc::sysconf(libc::_SC_OPEN_MAX) as i32;
         command.pre_exec(move || {
             for fd in 3..fd_limit {
                 libc::close(fd);

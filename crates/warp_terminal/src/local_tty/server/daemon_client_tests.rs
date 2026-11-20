@@ -109,3 +109,66 @@ fn daemon_exit_marks_attached_sessions_unavailable() {
     session.handle.kill().unwrap();
     assert!(client.list().is_err());
 }
+
+#[test]
+fn connect_at_returns_none_if_the_daemon_closes_during_the_handshake() {
+    let (_dir, paths) = temp_paths();
+    std::fs::create_dir_all(&paths.dir).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(&paths.socket).unwrap();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        drop(stream);
+    });
+    assert!(DaemonClient::connect_at(&paths.socket).unwrap().is_none());
+    server.join().unwrap();
+}
+
+#[test]
+fn connect_or_spawn_replaces_a_daemon_that_closes_during_the_handshake() {
+    let (_dir, paths) = temp_paths();
+    std::fs::create_dir_all(&paths.dir).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(&paths.socket).unwrap();
+    let closer = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        drop(stream);
+        drop(listener);
+    });
+    let running = Mutex::new(None);
+    let client = DaemonClient::connect_or_spawn_with(&paths.socket, || {
+        closer.join().unwrap();
+        *running.lock() = Some(RunningDaemon::start(&paths));
+        Ok(())
+    })
+    .unwrap();
+    assert!(client.list().unwrap().is_empty());
+    running.lock().take().unwrap().stop();
+}
+
+#[test]
+fn oversized_request_fails_without_dropping_the_connection() {
+    let (_dir, paths) = temp_paths();
+    let running = RunningDaemon::start(&paths);
+    let client = DaemonClient::connect_at(&paths.socket).unwrap().unwrap();
+    let environment = SpawnEnvironment {
+        vars: vec![(
+            "EXAMPLE_HUGE".into(),
+            "x".repeat(protocol::MAX_CLIENT_FRAME_SIZE).into(),
+        )],
+        cwd: None,
+    };
+    let err = client
+        .spawn_with_environment(
+            PersistentSessionId::from(uuid::Uuid::from_u128(2)),
+            SessionMetadata {
+                hook_session_id: 1,
+                shell_type: "bash".to_owned(),
+            },
+            sh_options("true"),
+            environment,
+        )
+        .err()
+        .unwrap();
+    assert!(err.to_string().contains("too large"), "{err:#}");
+    assert!(client.list().unwrap().is_empty());
+    running.stop();
+}

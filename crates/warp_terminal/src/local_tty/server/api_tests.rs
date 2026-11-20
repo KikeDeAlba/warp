@@ -93,3 +93,33 @@ fn daemon_event_round_trips_through_bincode() {
         })
     ));
 }
+
+#[test]
+fn spawn_environment_round_trips_non_utf8_values() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let environment = SpawnEnvironment {
+        vars: vec![
+            (OsString::from("EXAMPLE_PLAIN"), OsString::from("value")),
+            (
+                OsString::from("EXAMPLE_RAW"),
+                OsString::from_vec(vec![0x66, 0xff, 0xfe, 0x6f]),
+            ),
+        ],
+        cwd: Some(OsString::from_vec(vec![b'/', 0xff])),
+    };
+    let bytes = bincode::serialize(&environment).unwrap();
+    let decoded: SpawnEnvironment = bincode::deserialize(&bytes).unwrap();
+    assert_eq!(decoded, environment);
+}
+
+#[test]
+fn captured_environment_matches_the_process() {
+    let environment = SpawnEnvironment::capture();
+    let expected: Vec<_> = std::env::vars_os().collect();
+    assert_eq!(environment.vars, expected);
+    assert_eq!(
+        environment.cwd,
+        std::env::current_dir().ok().map(PathBuf::into_os_string)
+    );
+}
