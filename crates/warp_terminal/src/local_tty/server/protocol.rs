@@ -1,11 +1,14 @@
+use std::collections::VecDeque;
 use std::io::{IoSlice, IoSliceMut};
 use std::os::unix::prelude::*;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use itertools::Itertools;
 use nix::cmsg_space;
 use nix::errno::Errno;
 use nix::sys::socket;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use super::api;
@@ -278,3 +281,294 @@ enum ReceiveMessageHeaderResult {
         cmsgs: Vec<socket::ControlMessageOwned>,
     },
 }
+
+/// The maximum number of file descriptors that can accompany a single frame.
+pub(super) const MAX_FRAME_FDS: usize = 2;
+
+/// The maximum size of a single frame payload, in bytes.
+pub(super) const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
+
+/// How long a sender waits for a full socket buffer to drain before giving up.
+const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The control message buffer type used by generic frames.
+type FrameAuxData = [RawFd; MAX_FRAME_FDS];
+
+/// Sends `value` as a single frame: a big-endian `usize` length header followed
+/// by the bincode-serialized payload, with up to [`MAX_FRAME_FDS`] file
+/// descriptors attached to the first byte via `SCM_RIGHTS`.
+///
+/// Partial writes are retried until the full frame is sent. Non-blocking
+/// sockets are supported by waiting for writability.
+pub(super) fn send_frame<T: Serialize>(
+    socket_fd: impl AsRawFd,
+    value: &T,
+    fds: &[RawFd],
+) -> Result<()> {
+    ensure!(
+        fds.len() <= MAX_FRAME_FDS,
+        "Cannot send {} fds in a single frame",
+        fds.len()
+    );
+    let payload = bincode::serialize(value).context("Failed to serialize frame")?;
+    ensure!(
+        !payload.is_empty() && payload.len() <= MAX_FRAME_SIZE,
+        "Frame payload has invalid size {}",
+        payload.len()
+    );
+
+    let mut buf = Vec::with_capacity(USIZE_SIZE + payload.len());
+    buf.extend_from_slice(&payload.len().to_be_bytes());
+    buf.extend_from_slice(&payload);
+
+    let fd = socket_fd.as_raw_fd();
+    let rights = [socket::ControlMessage::ScmRights(fds)];
+    let mut written = 0;
+    while written < buf.len() {
+        let control_msgs: &[socket::ControlMessage] = if written == 0 && !fds.is_empty() {
+            &rights
+        } else {
+            &[]
+        };
+        match socket::sendmsg::<()>(
+            fd,
+            &[IoSlice::new(&buf[written..])],
+            control_msgs,
+            send_flags(),
+            None,
+        ) {
+            Ok(n) => written += n,
+            Err(Errno::EINTR) => continue,
+            Err(Errno::EAGAIN) => wait_for(fd, libc::POLLOUT, SEND_TIMEOUT)?,
+            Err(err) => bail!("Failed to send frame: {err}"),
+        }
+    }
+    Ok(())
+}
+
+/// Receives a single frame from a socket, blocking until the full frame has
+/// arrived. Returns `None` if the peer closed the connection at a frame
+/// boundary.
+pub(super) fn receive_frame<T: DeserializeOwned>(
+    socket_fd: impl AsRawFd,
+) -> Result<Option<(T, Vec<OwnedFd>)>> {
+    let fd = socket_fd.as_raw_fd();
+    let mut fds = Vec::new();
+
+    let mut header = [0u8; USIZE_SIZE];
+    if !receive_exact(fd, &mut header, &mut fds)? {
+        return Ok(None);
+    }
+    let payload_size = usize::from_be_bytes(header);
+    ensure!(
+        payload_size > 0 && payload_size <= MAX_FRAME_SIZE,
+        "Received frame with invalid size {payload_size}"
+    );
+
+    let mut payload = vec![0; payload_size];
+    ensure!(
+        receive_exact(fd, &mut payload, &mut fds)?,
+        "Connection closed in the middle of a frame"
+    );
+    let value = bincode::deserialize(&payload).context("Failed to deserialize frame")?;
+    Ok(Some((value, fds)))
+}
+
+/// Fills `buf` completely, collecting any received fds. Returns `false` if the
+/// connection was closed before any byte was read.
+fn receive_exact(fd: RawFd, buf: &mut [u8], fds: &mut Vec<OwnedFd>) -> Result<bool> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match receive_some(fd, &mut buf[filled..], fds) {
+            Ok(0) if filled == 0 => return Ok(false),
+            Ok(0) => bail!("Connection closed in the middle of a frame"),
+            Ok(n) => filled += n,
+            Err(Errno::EINTR) => continue,
+            Err(Errno::EAGAIN) => wait_for(fd, libc::POLLIN, Duration::MAX)?,
+            Err(err) => bail!("Failed to receive frame: {err}"),
+        }
+    }
+    Ok(true)
+}
+
+/// Performs a single `recvmsg`, taking ownership of any received fds.
+fn receive_some(fd: RawFd, buf: &mut [u8], fds: &mut Vec<OwnedFd>) -> nix::Result<usize> {
+    let mut buffers = [IoSliceMut::new(buf)];
+    let mut cmsg_buffer = cmsg_space!(FrameAuxData);
+    let msg: socket::RecvMsg<()> =
+        socket::recvmsg(fd, &mut buffers, Some(&mut cmsg_buffer), receive_flags())?;
+    let bytes = msg.bytes;
+    let truncated = msg.flags.contains(socket::MsgFlags::MSG_CTRUNC);
+    for cmsg in msg.cmsgs() {
+        if let socket::ControlMessageOwned::ScmRights(received) = cmsg {
+            for raw in received {
+                // SAFETY: the kernel just installed this fd in our table and
+                // nothing else owns it.
+                let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+                let _ = set_cloexec(owned.as_raw_fd());
+                fds.push(owned);
+            }
+        }
+    }
+    if truncated {
+        log::warn!("Control message was truncated; some fds were dropped");
+        return Err(Errno::EMSGSIZE);
+    }
+    Ok(bytes)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn receive_flags() -> socket::MsgFlags {
+    socket::MsgFlags::MSG_CMSG_CLOEXEC
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn receive_flags() -> socket::MsgFlags {
+    socket::MsgFlags::empty()
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(super) fn send_flags() -> socket::MsgFlags {
+    socket::MsgFlags::MSG_NOSIGNAL
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub(super) fn send_flags() -> socket::MsgFlags {
+    socket::MsgFlags::empty()
+}
+
+/// Sets `FD_CLOEXEC` on `fd`.
+pub(super) fn set_cloexec(fd: RawFd) -> nix::Result<()> {
+    use nix::fcntl;
+    fcntl::fcntl(fd, fcntl::F_SETFD(fcntl::FdFlag::FD_CLOEXEC)).map(|_| ())
+}
+
+/// Sets `O_NONBLOCK` on `fd`.
+pub(super) fn set_nonblocking(fd: RawFd) -> nix::Result<()> {
+    use nix::fcntl;
+    let flags = fcntl::OFlag::from_bits_truncate(fcntl::fcntl(fd, fcntl::F_GETFL)?);
+    fcntl::fcntl(fd, fcntl::F_SETFL(flags | fcntl::OFlag::O_NONBLOCK)).map(|_| ())
+}
+
+/// Waits until `fd` reports `events`, or fails after `timeout`.
+fn wait_for(fd: RawFd, events: libc::c_short, timeout: Duration) -> Result<()> {
+    let timeout_ms = if timeout == Duration::MAX {
+        -1
+    } else {
+        timeout.as_millis().min(libc::c_int::MAX as u128) as libc::c_int
+    };
+    loop {
+        let mut pollfd = libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        };
+        // SAFETY: `pollfd` is a valid, initialized pollfd for the duration of
+        // the call.
+        let res = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+        match res {
+            0 => bail!("Timed out waiting for socket readiness"),
+            n if n > 0 => return Ok(()),
+            _ => {
+                let err = std::io::Error::last_os_error();
+                if err.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(err).context("poll failed");
+                }
+            }
+        }
+    }
+}
+
+/// The outcome of [`FrameReader::fill`].
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum FillResult {
+    /// Every available byte was read; the socket would block.
+    WouldBlock,
+    /// The peer closed the connection.
+    Closed,
+}
+
+/// Incrementally reassembles frames from a non-blocking socket.
+///
+/// Bytes and fds are accumulated across reads. Each received fd is associated
+/// with the absolute stream offset at which it arrived, which is the first byte
+/// of the `sendmsg` call that carried it, so it is attributed to the frame that
+/// contains that byte.
+#[derive(Default)]
+pub(super) struct FrameReader {
+    buf: Vec<u8>,
+    /// The absolute stream offset of `buf[0]`.
+    consumed: u64,
+    fds: VecDeque<(u64, OwnedFd)>,
+}
+
+impl FrameReader {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reads every available byte from `fd`.
+    pub fn fill(&mut self, fd: RawFd) -> Result<FillResult> {
+        let mut chunk = [0u8; 16 * 1024];
+        loop {
+            let offset = self.consumed + self.buf.len() as u64;
+            let mut fds = Vec::new();
+            let result = receive_some(fd, &mut chunk, &mut fds);
+            self.fds.extend(fds.into_iter().map(|fd| (offset, fd)));
+            match result {
+                Ok(0) => return Ok(FillResult::Closed),
+                Ok(n) => {
+                    self.buf.extend_from_slice(&chunk[..n]);
+                    if self.pending_frame_size()? > MAX_FRAME_SIZE {
+                        bail!("Received oversized frame");
+                    }
+                }
+                Err(Errno::EINTR) => continue,
+                Err(Errno::EAGAIN) => return Ok(FillResult::WouldBlock),
+                Err(Errno::ECONNRESET) => return Ok(FillResult::Closed),
+                Err(err) => bail!("Failed to read from socket: {err}"),
+            }
+        }
+    }
+
+    fn pending_frame_size(&self) -> Result<usize> {
+        if self.buf.len() < USIZE_SIZE {
+            return Ok(0);
+        }
+        let mut header = [0u8; USIZE_SIZE];
+        header.copy_from_slice(&self.buf[..USIZE_SIZE]);
+        let size = usize::from_be_bytes(header);
+        ensure!(size > 0, "Received frame with invalid size 0");
+        Ok(size)
+    }
+
+    /// Returns the next complete frame, if one has been fully received.
+    pub fn next_frame<T: DeserializeOwned>(&mut self) -> Result<Option<(T, Vec<OwnedFd>)>> {
+        let size = self.pending_frame_size()?;
+        if size == 0 || self.buf.len() < USIZE_SIZE + size {
+            return Ok(None);
+        }
+        ensure!(size <= MAX_FRAME_SIZE, "Received oversized frame");
+        let frame_len = USIZE_SIZE + size;
+        let value = bincode::deserialize(&self.buf[USIZE_SIZE..frame_len])
+            .context("Failed to deserialize frame")?;
+        let frame_end = self.consumed + frame_len as u64;
+        let mut fds = Vec::new();
+        while self
+            .fds
+            .front()
+            .is_some_and(|(offset, _)| *offset < frame_end)
+        {
+            if let Some((_, fd)) = self.fds.pop_front() {
+                fds.push(fd);
+            }
+        }
+        self.buf.drain(..frame_len);
+        self.consumed = frame_end;
+        Ok(Some((value, fds)))
+    }
+}
+
+#[cfg(test)]
+#[path = "protocol_tests.rs"]
+mod tests;
