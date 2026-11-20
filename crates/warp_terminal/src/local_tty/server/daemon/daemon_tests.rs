@@ -252,8 +252,8 @@ fn kill_terminates_the_process_and_removes_the_session() {
     assert!(process_exists(pid));
 
     spawned.handle.kill().unwrap();
-    assert!(!process_exists(pid));
     assert!(client.list().unwrap().is_empty());
+    wait_until(|| !process_exists(pid));
     let mut data = stream(spawned.data);
     assert!(read_to_eof(&mut data).is_empty());
 }
@@ -348,14 +348,14 @@ fn prune_kills_detached_sessions_that_are_not_kept() {
         remaining,
         vec![(session_id(5), false), (session_id(7), true)]
     );
-    assert!(!process_exists(pruned.info.pid));
+    wait_until(|| !process_exists(pruned.info.pid));
     assert!(process_exists(kept.info.pid));
     assert!(process_exists(attached.info.pid));
 
     second.prune(vec![]).unwrap();
-    assert!(!process_exists(kept.info.pid));
+    wait_until(|| !process_exists(kept.info.pid));
     second.kill_all_attached();
-    assert!(!process_exists(attached.info.pid));
+    wait_until(|| !process_exists(attached.info.pid));
     assert!(second.list().unwrap().is_empty());
 }
 
@@ -372,7 +372,7 @@ fn spawning_an_existing_session_replaces_it() {
         .unwrap();
     assert_ne!(second.info.pid, old_pid);
     assert_eq!(second.info.replay_len, 0);
-    assert!(!process_exists(old_pid));
+    wait_until(|| !process_exists(old_pid));
     assert!(process_exists(second.info.pid));
     let mut old_data = stream(first.data);
     assert!(read_to_eof(&mut old_data).is_empty());
@@ -397,7 +397,7 @@ fn spawning_over_a_detached_session_replaces_it() {
     let second = second_client
         .spawn(session_id(15), metadata(), sh_options("read x"))
         .unwrap();
-    assert!(!process_exists(first.info.pid));
+    wait_until(|| !process_exists(first.info.pid));
     let sessions = second_client.list().unwrap();
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0].pid, second.info.pid);
@@ -455,12 +455,20 @@ fn daemon_with_a_session_does_not_exit_when_idle() {
         config.idle_timeout = Duration::from_millis(200);
     });
     let client = daemon.client();
-    let _spawned = client
+    let spawned = client
         .spawn(session_id(12), metadata(), sh_options("read x"))
         .unwrap();
     client.detach_all();
+    drop(spawned);
     drop(client);
-    std::thread::sleep(Duration::from_millis(600));
+    wait_until(|| {
+        daemon
+            .stop
+            .stats
+            .unattended
+            .lock()
+            .is_some_and(|(since, checked)| checked - since >= Duration::from_millis(400))
+    });
     assert!(!daemon.thread.as_ref().unwrap().is_finished());
     assert_eq!(daemon.client().list().unwrap().len(), 1);
 }
@@ -577,8 +585,201 @@ fn backpressure_pauses_reading_without_losing_bytes() {
         .unwrap();
     let mut data = stream(spawned.data.try_clone().unwrap());
     data.write_all(b"go\n").unwrap();
-    std::thread::sleep(Duration::from_millis(300));
+    wait_until(|| daemon.stop.stats.pauses.load(Ordering::SeqCst) > 0);
     let received = read_until(&mut data, b"END");
     let a_count = received.iter().filter(|b| **b == b'a').count();
     assert_eq!(a_count, 12 * 1024 * 1024);
+}
+
+fn is_shell_identifier(key: &std::ffi::OsStr) -> bool {
+    let bytes = key.as_encoded_bytes();
+    bytes
+        .first()
+        .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+}
+
+#[test]
+fn shell_starts_from_the_client_environment() {
+    let daemon = TestDaemon::start();
+    let client = daemon.client();
+    let home = daemon.marker("home");
+    std::fs::create_dir(&home).unwrap();
+    let dropped = std::env::vars_os()
+        .map(|(key, _)| key)
+        .find(|key| {
+            is_shell_identifier(key)
+                && !["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR"]
+                    .iter()
+                    .any(|name| key == name)
+                && !key.to_string_lossy().starts_with("TERM")
+                && !key.to_string_lossy().starts_with("WARP_")
+        })
+        .expect("the test process should have an ordinary environment variable");
+    let mut vars: Vec<_> = std::env::vars_os()
+        .filter(|(key, _)| *key != dropped && key != "HOME")
+        .collect();
+    vars.push(("HOME".into(), home.clone().into_os_string()));
+    vars.push(("EXAMPLE_CLIENT_VAR".into(), "from-client".into()));
+    let script = format!(
+        "printf 'client=%s;dropped=%s;cwd=%s;\\n' \"$EXAMPLE_CLIENT_VAR\" \"${{{dropped}-unset}}\" \"$(pwd -P)\"; read x",
+        dropped = dropped.to_string_lossy(),
+    );
+    let spawned = client
+        .spawn_with_environment(
+            session_id(20),
+            metadata(),
+            sh_options(&script),
+            SpawnEnvironment {
+                vars,
+                cwd: std::env::current_dir().ok().map(|cwd| cwd.into_os_string()),
+            },
+        )
+        .unwrap();
+    let mut data = stream(spawned.data.try_clone().unwrap());
+    let output = String::from_utf8_lossy(&read_until(&mut data, b";\r\n")).into_owned();
+    let expected = format!(
+        "client=from-client;dropped=unset;cwd={};",
+        home.canonicalize().unwrap().display()
+    );
+    assert!(output.contains(&expected), "output: {output:?}");
+    assert!(std::env::var_os(&dropped).is_some());
+    assert!(std::env::var_os("EXAMPLE_CLIENT_VAR").is_none());
+}
+
+#[test]
+fn connection_without_hello_is_closed_after_the_timeout() {
+    let daemon = TestDaemon::start_with(|config| {
+        config.hello_timeout = Duration::from_millis(100);
+    });
+    let mut stream = UnixStream::connect(&daemon.paths.socket).unwrap();
+    stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+    assert!(read_to_eof(&mut stream).is_empty());
+    assert!(daemon.client().is_alive());
+}
+
+#[test]
+fn connections_above_the_limit_are_refused() {
+    let daemon = TestDaemon::start_with(|config| {
+        config.max_connections = 2;
+    });
+    let first = UnixStream::connect(&daemon.paths.socket).unwrap();
+    let second = UnixStream::connect(&daemon.paths.socket).unwrap();
+    let mut third = UnixStream::connect(&daemon.paths.socket).unwrap();
+    third.set_read_timeout(Some(TIMEOUT)).unwrap();
+    assert!(read_to_eof(&mut third).is_empty());
+
+    drop((first, second));
+    wait_until(|| {
+        DaemonClient::connect_at(&daemon.paths.socket)
+            .unwrap()
+            .is_some()
+    });
+}
+
+#[test]
+fn oversized_client_frame_closes_the_connection() {
+    let daemon = TestDaemon::start();
+    let mut stream = UnixStream::connect(&daemon.paths.socket).unwrap();
+    stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+    stream
+        .write_all(&(protocol::MAX_CLIENT_FRAME_SIZE + 1).to_be_bytes())
+        .unwrap();
+    assert!(read_to_eof(&mut stream).is_empty());
+}
+
+#[test]
+fn kill_does_not_wait_for_a_process_that_ignores_sigterm() {
+    let daemon = TestDaemon::start();
+    let client = daemon.client();
+    let mut spawned = client
+        .spawn(
+            session_id(21),
+            metadata(),
+            sh_options("trap '' TERM; read x"),
+        )
+        .unwrap();
+    let pid = spawned.info.pid;
+    spawned.handle.kill().unwrap();
+    wait_until(|| !process_exists(pid));
+    assert!(client.list().unwrap().is_empty());
+}
+
+#[test]
+fn private_dir_is_created_with_mode_0700() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = DaemonPaths::in_dir(dir.path().join("nested").join("ts"));
+    assert!(!paths.validate_private_dir().unwrap());
+    paths.ensure_private_dir().unwrap();
+    let mode = std::fs::metadata(&paths.dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700);
+    assert!(paths.validate_private_dir().unwrap());
+}
+
+#[test]
+fn private_dir_with_loose_permissions_fails_validation_and_is_tightened() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = DaemonPaths::in_dir(dir.path().join("ts"));
+    std::fs::create_dir(&paths.dir).unwrap();
+    std::fs::set_permissions(&paths.dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(paths.validate_private_dir().is_err());
+    paths.ensure_private_dir().unwrap();
+    assert!(paths.validate_private_dir().unwrap());
+}
+
+#[test]
+fn symlinked_private_dir_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let paths = DaemonPaths::in_dir(dir.path().join("ts"));
+    std::os::unix::fs::symlink(&target, &paths.dir).unwrap();
+    assert!(paths.validate_private_dir().is_err());
+    assert!(paths.ensure_private_dir().is_err());
+}
+
+#[test]
+fn fallback_dir_prefers_the_runtime_dir() {
+    use super::listener::fallback_dir;
+    assert_eq!(
+        fallback_dir(Some("/run/user/501".into()), Some("/var/tmp".into()), 501),
+        std::path::PathBuf::from("/run/user/501/warp-ts")
+    );
+    assert_eq!(
+        fallback_dir(Some("relative".into()), Some("/var/tmp".into()), 501),
+        std::path::PathBuf::from("/var/tmp/warp-ts-501")
+    );
+    assert_eq!(
+        fallback_dir(None, None, 501),
+        std::path::PathBuf::from("/tmp/warp-ts-501")
+    );
+}
+
+#[test]
+fn peer_uid_mismatch_is_rejected() {
+    let (ours, _theirs) = UnixStream::pair().unwrap();
+    let uid = nix::unistd::geteuid().as_raw();
+    check_peer_uid(ours.as_raw_fd(), uid).unwrap();
+    assert!(check_peer_uid(ours.as_raw_fd(), uid.wrapping_add(1)).is_err());
+}
+
+#[test]
+fn log_is_rotated_once_it_exceeds_the_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v1.log");
+    std::fs::write(&path, b"0123456789").unwrap();
+    let target = OpenOptions::new().append(true).open(&path).unwrap();
+
+    assert!(!rotate_log(&path, 10, &[target.as_raw_fd()]).unwrap());
+    std::fs::write(&path, b"0123456789AB").unwrap();
+    assert!(rotate_log(&path, 10, &[target.as_raw_fd()]).unwrap());
+
+    (&target).write_all(b"fresh").unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"fresh");
+    let mut old = path.clone().into_os_string();
+    old.push(".old");
+    assert_eq!(std::fs::read(old).unwrap(), b"0123456789AB");
 }

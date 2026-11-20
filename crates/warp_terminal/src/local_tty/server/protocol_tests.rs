@@ -6,7 +6,7 @@ use super::*;
 use crate::event::ObservedExitStatus;
 use crate::local_tty::server::api::{
     AttachInfo, ClientMessage, DaemonEvent, DaemonMessage, DaemonRequest, DaemonResponse,
-    PersistentSessionId, SessionMetadata, SessionSummary,
+    PersistentSessionId, SessionMetadata, SessionSummary, SpawnEnvironment,
 };
 use crate::local_tty::server::test_util::sh_options;
 
@@ -39,6 +39,10 @@ fn client_messages() -> Vec<ClientMessage> {
             session_id: sample_id(1),
             metadata: sample_metadata(),
             options: Box::new(sh_options("true")),
+            environment: Some(SpawnEnvironment {
+                vars: vec![("EXAMPLE_VAR".into(), "example-value".into())],
+                cwd: Some("/tmp/example".into()),
+            }),
         },
         DaemonRequest::Attach {
             session_id: sample_id(2),

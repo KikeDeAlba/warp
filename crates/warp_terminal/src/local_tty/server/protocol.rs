@@ -288,6 +288,13 @@ pub(super) const MAX_FRAME_FDS: usize = 2;
 /// The maximum size of a single frame payload, in bytes.
 pub(super) const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
 
+/// The maximum size of a frame sent by a client to the daemon. Large enough
+/// for a `Spawn` request carrying the client's full environment.
+pub(super) const MAX_CLIENT_FRAME_SIZE: usize = 4 * 1024 * 1024;
+
+/// The maximum number of bytes [`FrameReader::fill`] reads in one call.
+pub(super) const FILL_BUDGET: usize = 256 * 1024;
+
 /// How long a sender waits for a full socket buffer to drain before giving up.
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -310,17 +317,7 @@ pub(super) fn send_frame<T: Serialize>(
         "Cannot send {} fds in a single frame",
         fds.len()
     );
-    let payload = bincode::serialize(value).context("Failed to serialize frame")?;
-    ensure!(
-        !payload.is_empty() && payload.len() <= MAX_FRAME_SIZE,
-        "Frame payload has invalid size {}",
-        payload.len()
-    );
-
-    let mut buf = Vec::with_capacity(USIZE_SIZE + payload.len());
-    buf.extend_from_slice(&payload.len().to_be_bytes());
-    buf.extend_from_slice(&payload);
-
+    let buf = encode_frame(value)?;
     let fd = socket_fd.as_raw_fd();
     let rights = [socket::ControlMessage::ScmRights(fds)];
     let mut written = 0;
@@ -340,10 +337,42 @@ pub(super) fn send_frame<T: Serialize>(
             Ok(n) => written += n,
             Err(Errno::EINTR) => continue,
             Err(Errno::EAGAIN) => wait_for(fd, libc::POLLOUT, SEND_TIMEOUT)?,
-            Err(err) => bail!("Failed to send frame: {err}"),
+            Err(err) => return Err(anyhow::Error::new(err).context("Failed to send frame")),
         }
     }
     Ok(())
+}
+
+/// Serializes `value` into a frame: a big-endian `usize` length header
+/// followed by the bincode payload.
+pub(super) fn encode_frame<T: Serialize>(value: &T) -> Result<Vec<u8>> {
+    let payload = bincode::serialize(value).context("Failed to serialize frame")?;
+    ensure!(
+        !payload.is_empty() && payload.len() <= MAX_FRAME_SIZE,
+        "Frame payload has invalid size {}",
+        payload.len()
+    );
+    let mut buf = Vec::with_capacity(USIZE_SIZE + payload.len());
+    buf.extend_from_slice(&payload.len().to_be_bytes());
+    buf.extend_from_slice(&payload);
+    Ok(buf)
+}
+
+/// Returns whether `err` means the peer went away: `EPIPE`, `ECONNRESET`,
+/// `ENOTCONN`, or a connection closed in the middle of a frame.
+pub(super) fn is_disconnect(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause.downcast_ref::<Errno>().is_some_and(|errno| {
+            matches!(errno, Errno::EPIPE | Errno::ECONNRESET | Errno::ENOTCONN)
+        }) || cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::NotConnected
+            )
+        })
+    })
 }
 
 /// Receives a single frame from a socket, blocking until the full frame has
@@ -366,10 +395,10 @@ pub(super) fn receive_frame<T: DeserializeOwned>(
     );
 
     let mut payload = vec![0; payload_size];
-    ensure!(
-        receive_exact(fd, &mut payload, &mut fds)?,
-        "Connection closed in the middle of a frame"
-    );
+    if !receive_exact(fd, &mut payload, &mut fds)? {
+        return Err(anyhow::Error::new(Errno::ECONNRESET)
+            .context("Connection closed in the middle of a frame"));
+    }
     let value = bincode::deserialize(&payload).context("Failed to deserialize frame")?;
     Ok(Some((value, fds)))
 }
@@ -381,11 +410,14 @@ fn receive_exact(fd: RawFd, buf: &mut [u8], fds: &mut Vec<OwnedFd>) -> Result<bo
     while filled < buf.len() {
         match receive_some(fd, &mut buf[filled..], fds) {
             Ok(0) if filled == 0 => return Ok(false),
-            Ok(0) => bail!("Connection closed in the middle of a frame"),
+            Ok(0) => {
+                return Err(anyhow::Error::new(Errno::ECONNRESET)
+                    .context("Connection closed in the middle of a frame"));
+            }
             Ok(n) => filled += n,
             Err(Errno::EINTR) => continue,
             Err(Errno::EAGAIN) => wait_for(fd, libc::POLLIN, Duration::MAX)?,
-            Err(err) => bail!("Failed to receive frame: {err}"),
+            Err(err) => return Err(anyhow::Error::new(err).context("Failed to receive frame")),
         }
     }
     Ok(true)
@@ -484,6 +516,8 @@ fn wait_for(fd: RawFd, events: libc::c_short, timeout: Duration) -> Result<()> {
 pub(super) enum FillResult {
     /// Every available byte was read; the socket would block.
     WouldBlock,
+    /// [`FILL_BUDGET`] bytes were read; more may be available.
+    Budget,
     /// The peer closed the connection.
     Closed,
 }
@@ -494,23 +528,42 @@ pub(super) enum FillResult {
 /// with the absolute stream offset at which it arrived, which is the first byte
 /// of the `sendmsg` call that carried it, so it is attributed to the frame that
 /// contains that byte.
-#[derive(Default)]
 pub(super) struct FrameReader {
     buf: Vec<u8>,
     /// The absolute stream offset of `buf[0]`.
     consumed: u64,
     fds: VecDeque<(u64, OwnedFd)>,
+    max_frame_size: usize,
+}
+
+impl Default for FrameReader {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FrameReader {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_max_frame_size(MAX_FRAME_SIZE)
     }
 
-    /// Reads every available byte from `fd`.
+    pub fn with_max_frame_size(max_frame_size: usize) -> Self {
+        Self {
+            buf: Vec::new(),
+            consumed: 0,
+            fds: VecDeque::new(),
+            max_frame_size,
+        }
+    }
+
+    /// Reads available bytes from `fd`, up to [`FILL_BUDGET`].
     pub fn fill(&mut self, fd: RawFd) -> Result<FillResult> {
         let mut chunk = [0u8; 16 * 1024];
+        let mut read = 0;
         loop {
+            if read >= FILL_BUDGET {
+                return Ok(FillResult::Budget);
+            }
             let offset = self.consumed + self.buf.len() as u64;
             let mut fds = Vec::new();
             let result = receive_some(fd, &mut chunk, &mut fds);
@@ -518,8 +571,9 @@ impl FrameReader {
             match result {
                 Ok(0) => return Ok(FillResult::Closed),
                 Ok(n) => {
+                    read += n;
                     self.buf.extend_from_slice(&chunk[..n]);
-                    if self.pending_frame_size()? > MAX_FRAME_SIZE {
+                    if self.pending_frame_size()? > self.max_frame_size {
                         bail!("Received oversized frame");
                     }
                 }
@@ -548,7 +602,7 @@ impl FrameReader {
         if size == 0 || self.buf.len() < USIZE_SIZE + size {
             return Ok(None);
         }
-        ensure!(size <= MAX_FRAME_SIZE, "Received oversized frame");
+        ensure!(size <= self.max_frame_size, "Received oversized frame");
         let frame_len = USIZE_SIZE + size;
         let value = bincode::deserialize(&self.buf[USIZE_SIZE..frame_len])
             .context("Failed to deserialize frame")?;
@@ -566,6 +620,103 @@ impl FrameReader {
         self.buf.drain(..frame_len);
         self.consumed = frame_end;
         Ok(Some((value, fds)))
+    }
+}
+
+/// The outcome of [`FrameWriter::flush`].
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum FlushResult {
+    /// Every queued frame was written.
+    Done,
+    /// The socket is full; flush again once it is writable.
+    WouldBlock,
+}
+
+struct OutboundFrame {
+    bytes: Vec<u8>,
+    written: usize,
+    fds: Vec<OwnedFd>,
+}
+
+/// Queues frames for a non-blocking socket and writes them as the socket
+/// accepts them, so a slow peer never blocks the sender.
+pub(super) struct FrameWriter {
+    queue: VecDeque<OutboundFrame>,
+    queued_bytes: usize,
+    max_queued_bytes: usize,
+}
+
+impl FrameWriter {
+    pub fn new(max_queued_bytes: usize) -> Self {
+        Self {
+            queue: VecDeque::new(),
+            queued_bytes: 0,
+            max_queued_bytes,
+        }
+    }
+
+    /// Queues `value` with `fds` attached to its first byte. Fails if the
+    /// queue would exceed its limit.
+    pub fn push<T: Serialize>(&mut self, value: &T, fds: Vec<OwnedFd>) -> Result<()> {
+        ensure!(
+            fds.len() <= MAX_FRAME_FDS,
+            "Cannot send {} fds in a single frame",
+            fds.len()
+        );
+        let bytes = encode_frame(value)?;
+        ensure!(
+            self.queued_bytes + bytes.len() <= self.max_queued_bytes,
+            "Outbound queue is full"
+        );
+        self.queued_bytes += bytes.len();
+        self.queue.push_back(OutboundFrame {
+            bytes,
+            written: 0,
+            fds,
+        });
+        Ok(())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    /// Writes queued frames until the queue is empty or the socket would
+    /// block. The fds of every frame whose first byte was written are moved to
+    /// `sent_fds`, so the caller can keep them open while they are in flight.
+    pub fn flush(&mut self, fd: RawFd, sent_fds: &mut Vec<OwnedFd>) -> Result<FlushResult> {
+        while let Some(frame) = self.queue.front_mut() {
+            let raw_fds: Vec<RawFd> = if frame.written == 0 {
+                frame.fds.iter().map(AsRawFd::as_raw_fd).collect()
+            } else {
+                Vec::new()
+            };
+            let rights = [socket::ControlMessage::ScmRights(&raw_fds)];
+            let control_msgs: &[socket::ControlMessage] =
+                if raw_fds.is_empty() { &[] } else { &rights };
+            match socket::sendmsg::<()>(
+                fd,
+                &[IoSlice::new(&frame.bytes[frame.written..])],
+                control_msgs,
+                send_flags(),
+                None,
+            ) {
+                Ok(n) => {
+                    if frame.written == 0 {
+                        sent_fds.append(&mut frame.fds);
+                    }
+                    frame.written += n;
+                    if frame.written == frame.bytes.len() {
+                        self.queued_bytes -= frame.bytes.len();
+                        self.queue.pop_front();
+                    }
+                }
+                Err(Errno::EINTR) => continue,
+                Err(Errno::EAGAIN) => return Ok(FlushResult::WouldBlock),
+                Err(err) => return Err(anyhow::Error::new(err).context("Failed to send frame")),
+            }
+        }
+        Ok(FlushResult::Done)
     }
 }
 

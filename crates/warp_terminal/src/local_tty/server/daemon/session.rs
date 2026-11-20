@@ -130,6 +130,11 @@ impl Session {
         })
     }
 
+    #[cfg(test)]
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
     pub fn summary(&self) -> SessionSummary {
         SessionSummary {
             session_id: self.id,

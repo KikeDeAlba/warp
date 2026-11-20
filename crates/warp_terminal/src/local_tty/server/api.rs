@@ -1,3 +1,6 @@
+use std::ffi::OsString;
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 use crate::event::ObservedExitStatus;
@@ -85,6 +88,27 @@ pub struct SessionMetadata {
     pub shell_type: String,
 }
 
+/// The process context of the client at spawn time. The daemon spawns the
+/// shell with exactly these variables as its base environment, as if the
+/// client had spawned it, instead of the environment the daemon started with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpawnEnvironment {
+    pub vars: Vec<(OsString, OsString)>,
+    /// An `OsString` rather than a `PathBuf` so non-UTF-8 paths survive
+    /// serialization.
+    pub cwd: Option<OsString>,
+}
+
+impl SpawnEnvironment {
+    /// Captures the current process environment and working directory.
+    pub fn capture() -> Self {
+        Self {
+            vars: std::env::vars_os().collect(),
+            cwd: std::env::current_dir().ok().map(PathBuf::into_os_string),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientMessage {
     Hello {
@@ -105,6 +129,8 @@ pub enum DaemonRequest {
         session_id: PersistentSessionId,
         metadata: SessionMetadata,
         options: Box<PtyOptions>,
+        /// `None` keeps the daemon's own environment.
+        environment: Option<SpawnEnvironment>,
     },
     Attach {
         session_id: PersistentSessionId,
