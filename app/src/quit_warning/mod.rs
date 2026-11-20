@@ -311,6 +311,23 @@ impl UnsavedStateSummary<'static> {
     }
 }
 
+/// Whether every running command in `summary` keeps running after quitting:
+/// only when the whole app quits with persistence on and each of their shells
+/// is owned by a live persistent session daemon.
+fn sessions_keep_running_after_quit(
+    scope: &QuitScope<'_>,
+    persist_sessions: bool,
+    summary: &RunningSessionSummary<'_>,
+) -> bool {
+    matches!(scope, QuitScope::App)
+        && persist_sessions
+        && !summary.long_running_cmds.is_empty()
+        && summary
+            .long_running_cmds
+            .iter()
+            .all(|session| session.persists_after_quit())
+}
+
 impl<'a> UnsavedStateSummary<'a> {
     pub fn for_pane(
         pane_group: &'a PaneGroup,
@@ -339,8 +356,11 @@ impl<'a> UnsavedStateSummary<'a> {
         let code_review_summary = CodeEditorSummary::new(&code_review_views);
 
         let num_shared_sessions = scope.shared_sessions(ctx);
-        let sessions_keep_running = matches!(scope, QuitScope::App)
-            && GeneralSettings::as_ref(ctx).should_persist_sessions();
+        let sessions_keep_running = sessions_keep_running_after_quit(
+            &scope,
+            GeneralSettings::as_ref(ctx).should_persist_sessions(),
+            &sessions_summary,
+        );
 
         UnsavedStateSummary {
             sessions_keep_running,
@@ -622,3 +642,7 @@ fn on_disable_warning_modal(ctx: &mut AppContext) {
     });
     send_telemetry_from_app_ctx!(TelemetryEvent::QuitModalDisabled, ctx);
 }
+
+#[cfg(test)]
+#[path = "quit_warning_tests.rs"]
+mod tests;
