@@ -4,6 +4,7 @@ use warp_core::settings::macros::define_settings_group;
 use warp_core::settings::{RespectUserSyncSetting, SupportedPlatforms, SyncToCloud};
 
 use crate::banner::BannerState;
+use crate::channel::{Channel, ChannelState};
 use crate::resource_center::Tip;
 
 define_settings_group!(GeneralSettings, settings: [
@@ -200,8 +201,26 @@ impl GeneralSettings {
             *self.persistent_sessions,
             *self.restore_session,
             std::env::var_os("APPIMAGE").is_some(),
+        ) && persistent_sessions_allowed_for_channel(
+            ChannelState::channel(),
+            std::env::var(INTEGRATION_PERSISTENT_SESSIONS_ENV)
+                .ok()
+                .as_deref(),
         )
     }
+}
+
+/// Set to `1` to opt integration tests into persistent sessions, which they
+/// otherwise do not use so that they never spawn or reuse a daemon that
+/// outlives the test.
+pub const INTEGRATION_PERSISTENT_SESSIONS_ENV: &str = "WARP_INTEGRATION_PERSISTENT_SESSIONS";
+
+/// Integration tests only persist sessions when the opt-in variable is `1`.
+pub fn persistent_sessions_allowed_for_channel(
+    channel: Channel,
+    integration_opt_in: Option<&str>,
+) -> bool {
+    channel != Channel::Integration || integration_opt_in == Some("1")
 }
 
 /// Persistence requires session restoration, and is disabled for AppImages

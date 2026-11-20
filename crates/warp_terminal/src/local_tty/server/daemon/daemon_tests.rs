@@ -740,19 +740,102 @@ fn symlinked_private_dir_is_rejected() {
 
 #[test]
 fn fallback_dir_prefers_the_runtime_dir() {
-    use super::listener::fallback_dir;
+    use super::listener::{fallback_dir, state_dir_key};
+    use std::path::{Path, PathBuf};
+    let state_dir = Path::new("/home/alice/.local/state/warp-terminal");
+    let key = state_dir_key(state_dir);
     assert_eq!(
-        fallback_dir(Some("/run/user/501".into()), Some("/var/tmp".into()), 501),
-        std::path::PathBuf::from("/run/user/501/warp-ts")
+        fallback_dir(
+            Some("/run/user/501".into()),
+            Some("/var/tmp".into()),
+            501,
+            state_dir
+        ),
+        PathBuf::from(format!("/run/user/501/warp-ts-{key}"))
     );
     assert_eq!(
-        fallback_dir(Some("relative".into()), Some("/var/tmp".into()), 501),
-        std::path::PathBuf::from("/var/tmp/warp-ts-501")
+        fallback_dir(
+            Some("relative".into()),
+            Some("/var/tmp".into()),
+            501,
+            state_dir
+        ),
+        PathBuf::from(format!("/var/tmp/warp-ts-501-{key}"))
     );
     assert_eq!(
-        fallback_dir(None, None, 501),
-        std::path::PathBuf::from("/tmp/warp-ts-501")
+        fallback_dir(None, None, 501, state_dir),
+        PathBuf::from(format!("/tmp/warp-ts-501-{key}"))
     );
+}
+
+#[test]
+fn state_dir_key_is_stable_short_and_distinct_per_state_dir() {
+    use super::listener::state_dir_key;
+    use std::path::Path;
+    let stable = Path::new("/home/alice/.local/state/warp-terminal");
+    let preview = Path::new("/home/alice/.local/state/warp-terminal-preview");
+    let other_home = Path::new("/home/bob/.local/state/warp-terminal");
+    assert_eq!(state_dir_key(Path::new("")), "9ce484222325");
+    assert_eq!(state_dir_key(Path::new("a")), "dc4c8601ec8c");
+    assert_eq!(state_dir_key(stable), state_dir_key(stable));
+    assert_eq!(state_dir_key(stable).len(), 12);
+    assert!(state_dir_key(stable).chars().all(|c| c.is_ascii_hexdigit()));
+    assert_ne!(state_dir_key(stable), state_dir_key(preview));
+    assert_ne!(state_dir_key(stable), state_dir_key(other_home));
+}
+
+#[test]
+fn short_state_dirs_keep_their_own_socket_directory() {
+    use std::path::{Path, PathBuf};
+    let paths = DaemonPaths::for_state_dir(
+        Path::new("/home/alice/.local/state/warp-terminal"),
+        None,
+        None,
+        501,
+    )
+    .unwrap();
+    assert_eq!(
+        paths.dir,
+        PathBuf::from("/home/alice/.local/state/warp-terminal/ts")
+    );
+}
+
+#[test]
+fn long_state_dirs_fall_back_to_distinct_directories() {
+    use std::path::Path;
+    let long_home = format!("/home/{}", "a".repeat(90));
+    let first = Path::new(&long_home).join("state").join("warp-terminal");
+    let second = Path::new(&long_home)
+        .join("state")
+        .join("warp-terminal-preview");
+    let first_paths = DaemonPaths::for_state_dir(&first, None, None, 501).unwrap();
+    let second_paths = DaemonPaths::for_state_dir(&second, None, None, 501).unwrap();
+    assert!(first_paths.dir.starts_with("/tmp"));
+    assert!(second_paths.dir.starts_with("/tmp"));
+    assert_ne!(first_paths.dir, second_paths.dir);
+    assert_ne!(first_paths.socket, second_paths.socket);
+    assert!(first_paths.socket.as_os_str().len() <= 100);
+}
+
+#[test]
+fn a_fallback_socket_path_too_long_to_bind_is_rejected() {
+    use super::listener::MAX_SUN_PATH_LEN;
+    use std::path::Path;
+    let state_dir = Path::new("/home/alice").join("a".repeat(100));
+    let long_tmpdir = format!("/var/{}", "t".repeat(MAX_SUN_PATH_LEN));
+    let err = DaemonPaths::for_state_dir(&state_dir, None, Some(long_tmpdir.into()), 501)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("socket path"), "{err}");
+    assert!(
+        err.contains(&format!("{MAX_SUN_PATH_LEN}-byte limit")),
+        "{err}"
+    );
+
+    let fitting_tmpdir = format!("/var/{}", "t".repeat(40));
+    let paths =
+        DaemonPaths::for_state_dir(&state_dir, None, Some(fitting_tmpdir.into()), 501).unwrap();
+    assert!(paths.socket.as_os_str().len() <= MAX_SUN_PATH_LEN);
 }
 
 #[test]

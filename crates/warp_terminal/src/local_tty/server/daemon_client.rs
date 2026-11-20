@@ -7,9 +7,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak, mpsc};
 use std::time::Duration;
 
-use instant::Instant;
-
 use anyhow::{Context, Result, anyhow, bail};
+use instant::Instant;
 use parking_lot::Mutex;
 use warp_errors::report_error;
 
@@ -222,14 +221,14 @@ pub struct DaemonClient {
 impl DaemonClient {
     /// Connects to the daemon, starting it if it isn't running.
     pub fn connect_or_spawn() -> anyhow::Result<Arc<Self>> {
-        let paths = DaemonPaths::default_for_user();
+        let paths = DaemonPaths::default_for_user()?;
         paths.ensure_private_dir()?;
         Self::connect_or_spawn_with(&paths.socket, spawn_daemon_process)
     }
 
     /// Connects to the daemon only if it is already running.
     pub fn connect_existing() -> anyhow::Result<Option<Arc<Self>>> {
-        let paths = DaemonPaths::default_for_user();
+        let paths = DaemonPaths::default_for_user()?;
         if !paths.validate_private_dir()? {
             return Ok(None);
         }
@@ -471,6 +470,21 @@ fn spawn_daemon_process() -> Result<()> {
 }
 
 fn spawn_daemon_command(program: &PathBuf) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    if let Some(set_disclaim) = spawn_macos::set_disclaim_fn() {
+        let subcommand = warp_cli::terminal_server_subcommand();
+        let outcome = spawn_macos::spawn_disclaimed_and_wait(
+            program,
+            &[
+                std::ffi::OsStr::new(&subcommand),
+                std::ffi::OsStr::new("--daemon"),
+            ],
+            set_disclaim,
+        );
+        if let Some(result) = disclaimed_launcher_result(outcome) {
+            return result;
+        }
+    }
     let mut command = command::blocking::Command::new(program);
     command
         .arg(warp_cli::terminal_server_subcommand())
@@ -494,6 +508,27 @@ fn spawn_daemon_command(program: &PathBuf) -> Result<()> {
         bail!("terminal daemon launcher exited with {status}");
     }
     Ok(())
+}
+
+/// The result of a disclaimed daemon launch, or `None` if nothing was
+/// launched and the regular spawn should be used instead.
+#[cfg(target_os = "macos")]
+fn disclaimed_launcher_result(outcome: spawn_macos::DisclaimedSpawn) -> Option<Result<()>> {
+    match outcome {
+        spawn_macos::DisclaimedSpawn::Exited(status) if status.success() => Some(Ok(())),
+        spawn_macos::DisclaimedSpawn::Exited(status) => Some(Err(anyhow!(
+            "terminal daemon launcher exited with {status}"
+        ))),
+        spawn_macos::DisclaimedSpawn::WaitFailed(err) => {
+            Some(Err(err.context("Failed to wait for terminal daemon")))
+        }
+        spawn_macos::DisclaimedSpawn::NotLaunched(err) => {
+            log::warn!(
+                "Could not spawn the terminal daemon with disclaimed responsibility; falling back to a regular spawn: {err:#}"
+            );
+            None
+        }
+    }
 }
 
 pub struct AttachedSession {
@@ -523,6 +558,10 @@ impl PtyHandle for DaemonPtyHandle {
         self.client.shared.kill_session(self.session_id)
     }
 }
+
+#[cfg(target_os = "macos")]
+#[path = "daemon_spawn_macos.rs"]
+mod spawn_macos;
 
 #[cfg(test)]
 #[path = "daemon_client_tests.rs"]

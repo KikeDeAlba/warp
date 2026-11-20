@@ -21,6 +21,8 @@ use settings::Setting as _;
 use uuid::Uuid;
 use warp_core::SessionId;
 use warp_errors::report_error;
+#[cfg(unix)]
+use warp_terminal::local_tty::server::PersistentSessionId;
 use warpui::r#async::Timer;
 use warpui::r#async::executor::Background;
 use warpui::{AppContext, Entity, ModelContext, ModelHandle, SingletonEntity, ViewHandle};
@@ -77,8 +79,6 @@ use crate::terminal::{
     PTY_READS_BROADCAST_CHANNEL_SIZE, ShellLaunchState, SizeInfo,
     TerminalManager as TerminalManagerTrait, TerminalModel, terminal_manager,
 };
-#[cfg(unix)]
-use warp_terminal::local_tty::server::PersistentSessionId;
 
 type PtyController = writeable_pty::PtyController<mio_channel::Sender<Message>>;
 type RemoteServerController =

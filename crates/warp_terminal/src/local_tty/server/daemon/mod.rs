@@ -19,9 +19,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use instant::Instant;
-
 use anyhow::{Context, Result, bail};
+use instant::Instant;
 use mio::Interest;
 use mio::net::{UnixListener, UnixStream};
 use nix::sys::socket;
@@ -106,7 +105,13 @@ pub(crate) fn run_daemon_process(
     init_feature_flags: impl FnOnce(),
     init_platform: impl FnOnce() -> anyhow::Result<()>,
 ) {
-    let paths = DaemonPaths::default_for_user();
+    let paths = match DaemonPaths::default_for_user() {
+        Ok(paths) => paths,
+        Err(err) => {
+            eprintln!("Failed to locate terminal daemon directory: {err:#}");
+            std::process::exit(1);
+        }
+    };
     if let Err(err) = paths.ensure_private_dir() {
         eprintln!("Failed to prepare terminal daemon directory: {err:#}");
         std::process::exit(1);

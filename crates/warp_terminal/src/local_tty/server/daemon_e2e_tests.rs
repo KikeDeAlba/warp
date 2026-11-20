@@ -24,9 +24,8 @@ use command::blocking::Command;
 use instant::Instant;
 
 use super::*;
-use crate::local_tty::server::RING_CAPACITY;
-use crate::local_tty::server::protocol;
 use crate::local_tty::server::test_util::sh_options;
+use crate::local_tty::server::{RING_CAPACITY, protocol};
 
 const BIN_ENV: &str = "WARP_DAEMON_E2E_BIN";
 const ROLE_ENV: &str = "WARP_DAEMON_E2E_ROLE";

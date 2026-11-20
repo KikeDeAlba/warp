@@ -1,11 +1,11 @@
 //! A daemon-owned PTY session and the byte pumping between its leader fd and
 //! an attached client's data socket.
 
-use instant::Instant;
 use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::process::Child;
 
+use instant::Instant;
 use mio::Interest;
 use mio::unix::SourceFd;
 use nix::errno::Errno;
