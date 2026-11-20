@@ -581,3 +581,81 @@ fn daemon_e2e_connect_or_spawn_starts_the_real_binary() {
     env.daemon_pids.push(env.daemon_pid());
     assert!(client.list().unwrap().is_empty());
 }
+
+#[test]
+fn daemon_e2e_shell_gets_the_client_environment_and_limits() {
+    e2e!(env);
+    let mut command = env.command(true);
+    command.env("EXAMPLE_STALE", "from-daemon-launch");
+    // SAFETY: the closure only calls async-signal-safe functions.
+    unsafe {
+        command.pre_exec(|| {
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit);
+            limit.rlim_cur = 256.min(limit.rlim_max);
+            libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+            libc::getrlimit(libc::RLIMIT_CORE, &mut limit);
+            limit.rlim_cur = limit.rlim_max;
+            libc::setrlimit(libc::RLIMIT_CORE, &limit);
+            Ok(())
+        });
+    }
+    assert!(command.status().unwrap().success());
+    let daemon = env.daemon_pid();
+    env.daemon_pids.push(daemon);
+    let client = env.client();
+
+    let script = "printf 'stale=%s;client=%s;core=%s;nofile=%s;cwd=%s;\\n' \
+                  \"${EXAMPLE_STALE-unset}\" \"$EXAMPLE_CLIENT_VAR\" \
+                  \"$(ulimit -c)\" \"$(ulimit -n)\" \"$(pwd -P)\"; read x";
+    let environment = SpawnEnvironment {
+        vars: vec![
+            ("PATH".into(), "/usr/bin:/bin".into()),
+            ("HOME".into(), env.home.clone().into_os_string()),
+            ("EXAMPLE_CLIENT_VAR".into(), "from-client".into()),
+        ],
+        cwd: Some("/".into()),
+    };
+    let session = client
+        .spawn_with_environment(session_id(30), metadata(), sh_options(script), environment)
+        .unwrap();
+    env.track(&session);
+    let mut data = stream(session.data.try_clone().unwrap());
+    let mut output = Vec::new();
+    let mut buf = [0u8; 1024];
+    while !output.ends_with(b";\r\n") {
+        let n = data.read(&mut buf).unwrap();
+        assert!(n > 0, "unexpected EOF");
+        output.extend_from_slice(&buf[..n]);
+    }
+    let output = String::from_utf8_lossy(&output).into_owned();
+
+    let core_hard = {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `limit` is valid for writes.
+        unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut limit) };
+        limit.rlim_max
+    };
+    assert!(
+        output.contains("stale=unset;client=from-client;"),
+        "{output}"
+    );
+    assert!(output.contains("nofile=256;"), "{output}");
+    if core_hard == libc::RLIM_INFINITY {
+        assert!(output.contains("core=unlimited;"), "{output}");
+    } else if core_hard > 0 {
+        assert!(!output.contains("core=0;"), "{output}");
+    }
+    let home = env.home.canonicalize().unwrap();
+    assert!(
+        output.contains(&format!("cwd={};", home.display())),
+        "{output}"
+    );
+    assert!(is_running(daemon));
+}
