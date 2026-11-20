@@ -26,7 +26,7 @@ mod event_loop;
 mod logging;
 mod protocol;
 #[cfg(test)]
-mod test_util;
+pub(crate) mod test_util;
 
 use std::collections::HashMap;
 use std::os::unix::prelude::*;

@@ -128,4 +128,20 @@ pub struct PtyOptions {
     /// (gated via the `WARP_PROMPT_NODE_VERSION_ENABLED` env var).
     pub node_version_chip_enabled: bool,
     pub close_fds: bool,
+    /// When set, the shell starts from exactly this environment instead of
+    /// inheriting the spawner's; Warp's own variables and `env_vars` are
+    /// applied on top. Entries that cannot be set are skipped.
+    #[serde(default)]
+    pub base_env: Option<Vec<(OsString, OsString)>>,
+    /// Soft resource limits the child sets for itself before exec, for
+    /// spawners whose own limits differ from the ones the shell should get.
+    #[serde(default)]
+    pub child_rlimits: Option<ChildResourceLimits>,
+}
+
+/// Soft resource limits restored in a spawned child, best effort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildResourceLimits {
+    pub nofile_soft: u64,
+    pub core_soft: u64,
 }

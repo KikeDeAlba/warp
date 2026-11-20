@@ -167,6 +167,8 @@ fn options() -> PtyOptions {
         honor_ps1: false,
         node_version_chip_enabled: false,
         close_fds: true,
+        base_env: None,
+        child_rlimits: None,
     }
 }
 

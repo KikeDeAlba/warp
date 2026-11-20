@@ -39,7 +39,10 @@ use super::server::{
 use super::spawner::{
     PersistentSessionsHandle, PtyHandle, PtySpawnHooks, PtySpawnInfo, PtySpawner, ReattachOutcome,
 };
-use super::{ChildEvent, EventedPty, EventedReadWrite, PersistentReattach, PtyOptions, SizeInfo};
+use super::{
+    ChildEvent, ChildResourceLimits, EventedPty, EventedReadWrite, PersistentReattach, PtyOptions,
+    SizeInfo,
+};
 use crate::ASSETS;
 use crate::bootstrap::raw_init_shell_script_for_shell;
 use crate::local_tty::docker_sandbox::{DOCKER_SANDBOX_HOME_DIR, DockerSandboxShellStarter};
@@ -273,6 +276,8 @@ pub(super) fn spawn(options: PtyOptions) -> Result<PtySpawnInfo> {
         honor_ps1,
         node_version_chip_enabled,
         close_fds,
+        base_env,
+        child_rlimits,
     } = options;
     let shell_starter = match shell_starter {
         ShellStarter::Direct(shell_starter) => shell_starter,
@@ -293,9 +298,10 @@ pub(super) fn spawn(options: PtyOptions) -> Result<PtySpawnInfo> {
         shell_debug_mode,
         honor_ps1,
         node_version_chip_enabled,
+        base_env,
     );
 
-    spawn_command_in_pty(command, &size, close_fds)
+    spawn_command_in_pty(command, &size, close_fds, child_rlimits)
 }
 
 /// Builds the `Command` for a host-shell PTY session: executable, args,
@@ -314,6 +320,7 @@ fn build_host_shell_command(
     shell_debug_mode: bool,
     honor_ps1: bool,
     node_version_chip_enabled: bool,
+    base_env: Option<Vec<(OsString, OsString)>>,
 ) -> Command {
     let pw = resolve_current_user();
 
@@ -326,12 +333,14 @@ fn build_host_shell_command(
     for arg in shell_starter.args() {
         builder.arg(arg);
     }
+    let base_env = BaseEnv::new(base_env);
+    base_env.apply(&mut builder);
 
     // Support an overridden home directory for integration tests, which
     // should execute in a more hermetic environment than one where the home
     // directory contains whatever happens to already exist there.
-    let home_dir = std::env::var("HOME")
-        .ok()
+    let home_dir = base_env
+        .var("HOME")
         .or_else(|| pw.as_ref().map(|pw| pw.dir.to_owned()))
         .unwrap_or_else(|| "/".to_owned());
 
@@ -346,8 +355,8 @@ fn build_host_shell_command(
     if let Some(user_name) = pw
         .as_ref()
         .map(|pw| pw.name.to_owned())
-        .or_else(|| std::env::var("USER").ok())
-        .or_else(|| std::env::var("LOGNAME").ok())
+        .or_else(|| base_env.var("USER"))
+        .or_else(|| base_env.var("LOGNAME"))
     {
         builder.env("LOGNAME", &user_name);
         builder.env("USER", &user_name);
@@ -496,6 +505,7 @@ fn spawn_command_in_pty(
     mut command: Command,
     size: &SizeInfo,
     close_fds: bool,
+    child_rlimits: Option<ChildResourceLimits>,
 ) -> Result<PtySpawnInfo> {
     let (leader, follower) = make_pty(size.to_winsize())?;
 
@@ -576,6 +586,13 @@ fn spawn_command_in_pty(
                 for fd in 3..fdlimit {
                     libc::close(fd);
                 }
+            }
+
+            // Restore the soft limits the spawner asked for. Best effort:
+            // a limit that cannot be set is left as inherited.
+            if let Some(limits) = child_rlimits {
+                set_soft_rlimit_in_child(libc::RLIMIT_NOFILE as c_int, limits.nofile_soft);
+                set_soft_rlimit_in_child(libc::RLIMIT_CORE as c_int, limits.core_soft);
             }
 
             #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -789,6 +806,69 @@ impl Pty {
     }
 }
 
+/// The environment a shell starts from: the spawner's own, or an explicit
+/// base that replaces it.
+struct BaseEnv(Option<Vec<(OsString, OsString)>>);
+
+impl BaseEnv {
+    fn new(vars: Option<Vec<(OsString, OsString)>>) -> Self {
+        Self(vars.map(|vars| {
+            vars.into_iter()
+                .filter(|(key, value)| is_settable_env_var(key, value))
+                .collect()
+        }))
+    }
+
+    /// Clears the inherited environment and applies the base, if any.
+    fn apply(&self, command: &mut Command) {
+        if let Some(vars) = &self.0 {
+            command.env_clear();
+            command.envs(vars.iter().map(|(key, value)| (key, value)));
+        }
+    }
+
+    /// Looks `key` up in the environment the shell starts from.
+    fn var(&self, key: &str) -> Option<String> {
+        match &self.0 {
+            Some(vars) => vars
+                .iter()
+                .rev()
+                .find(|(name, _)| name == key)
+                .and_then(|(_, value)| value.to_str())
+                .map(str::to_owned),
+            None => std::env::var(key).ok(),
+        }
+    }
+}
+
+/// Whether `Command` can set this variable without failing the spawn.
+fn is_settable_env_var(key: &std::ffi::OsStr, value: &std::ffi::OsStr) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let key = key.as_bytes();
+    !key.is_empty() && !key.contains(&b'=') && !key.contains(&0) && !value.as_bytes().contains(&0)
+}
+
+/// Sets the soft limit of `resource`, clamped to the hard limit. Only makes
+/// async-signal-safe calls, so it can run between fork and exec.
+fn set_soft_rlimit_in_child(resource: c_int, soft: u64) {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is valid for writes.
+    if unsafe { libc::getrlimit(resource as _, &mut limit) } != 0 {
+        return;
+    }
+    let soft = soft as libc::rlim_t;
+    limit.rlim_cur = if limit.rlim_max == libc::RLIM_INFINITY {
+        soft
+    } else {
+        soft.min(limit.rlim_max)
+    };
+    // SAFETY: `limit` is a valid rlimit.
+    unsafe { libc::setrlimit(resource as _, &limit) };
+}
+
 const CLOSE_FDS_FALLBACK_LIMIT: c_int = 1024;
 const CLOSE_FDS_MAX_LIMIT: c_int = 65536;
 
@@ -798,7 +878,7 @@ const CLOSE_FDS_MAX_LIMIT: c_int = 65536;
 /// Prefers the soft `RLIMIT_NOFILE` and falls back to `sysconf`, since either
 /// can be unlimited or fail; the result is capped so the post-fork loop stays
 /// short.
-fn close_fds_upper_bound() -> c_int {
+pub(super) fn close_fds_upper_bound() -> c_int {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -1051,6 +1131,8 @@ fn spawn_docker_sandbox(
         honor_ps1,
         node_version_chip_enabled,
         close_fds,
+        base_env,
+        child_rlimits,
     } = options;
 
     let command = build_docker_sandbox_command(
@@ -1062,9 +1144,10 @@ fn spawn_docker_sandbox(
         shell_debug_mode,
         honor_ps1,
         node_version_chip_enabled,
+        base_env,
     );
 
-    spawn_command_in_pty(command, &size, close_fds)
+    spawn_command_in_pty(command, &size, close_fds, child_rlimits)
 }
 
 /// Builds the `Command` for a Docker-sandbox PTY session: `sbx run`
@@ -1083,6 +1166,7 @@ fn build_docker_sandbox_command(
     shell_debug_mode: bool,
     honor_ps1: bool,
     node_version_chip_enabled: bool,
+    base_env: Option<Vec<(OsString, OsString)>>,
 ) -> Command {
     let pw = resolve_current_user();
 
@@ -1095,9 +1179,11 @@ fn build_docker_sandbox_command(
     for arg in docker_sandbox_run_args(docker_starter) {
         builder.arg(arg);
     }
+    let base_env = BaseEnv::new(base_env);
+    base_env.apply(&mut builder);
 
-    let home_dir = std::env::var("HOME")
-        .ok()
+    let home_dir = base_env
+        .var("HOME")
         .or_else(|| pw.as_ref().map(|pw| pw.dir.to_owned()))
         .unwrap_or_else(|| "/".to_owned());
 
@@ -1116,8 +1202,8 @@ fn build_docker_sandbox_command(
     if let Some(user_name) = pw
         .as_ref()
         .map(|pw| pw.name.to_owned())
-        .or_else(|| std::env::var("USER").ok())
-        .or_else(|| std::env::var("LOGNAME").ok())
+        .or_else(|| base_env.var("USER"))
+        .or_else(|| base_env.var("LOGNAME"))
     {
         builder.env("LOGNAME", &user_name);
         builder.env("USER", &user_name);

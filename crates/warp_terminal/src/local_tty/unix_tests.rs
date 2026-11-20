@@ -23,6 +23,7 @@ fn host_bash_command_sets_history_size_sentinels() {
         false,
         false,
         true,
+        None,
     );
 
     assert_eq!(
@@ -55,6 +56,7 @@ fn host_non_bash_command_does_not_set_history_size_sentinels() {
         false,
         false,
         true,
+        None,
     );
 
     assert_eq!(env_value(&command, "HISTFILESIZE"), None);
@@ -76,6 +78,7 @@ fn docker_sandbox_command_sets_history_size_sentinels() {
         false,
         false,
         true,
+        None,
     );
 
     assert_eq!(
@@ -283,4 +286,116 @@ fn close_fds_limit_falls_back_and_is_capped() {
 fn close_fds_upper_bound_is_sane() {
     let limit = close_fds_upper_bound();
     assert!((3..=CLOSE_FDS_MAX_LIMIT).contains(&limit));
+}
+
+#[test]
+fn base_env_replaces_the_inherited_environment() {
+    let base_env = vec![
+        ("HOME".into(), "/tmp/example-home".into()),
+        ("EXAMPLE_BASE".into(), "from-base".into()),
+        ("EXAMPLE_OVERRIDDEN".into(), "from-base".into()),
+        ("EXAMPLE=INVALID".into(), "skipped".into()),
+    ];
+    let env_vars = HashMap::from([("EXAMPLE_OVERRIDDEN".into(), "from-env-vars".into())]);
+    let command = build_host_shell_command(
+        shell_starter(ShellType::Zsh, "/bin/zsh"),
+        None,
+        env_vars,
+        None,
+        false,
+        false,
+        false,
+        false,
+        true,
+        Some(base_env),
+    );
+
+    assert_eq!(
+        env_value(&command, "HOME"),
+        Some(Some("/tmp/example-home".to_owned()))
+    );
+    assert_eq!(
+        env_value(&command, "EXAMPLE_BASE"),
+        Some(Some("from-base".to_owned()))
+    );
+    assert_eq!(
+        env_value(&command, "EXAMPLE_OVERRIDDEN"),
+        Some(Some("from-env-vars".to_owned()))
+    );
+    assert_eq!(env_value(&command, "EXAMPLE=INVALID"), None);
+    assert_eq!(
+        env_value(&command, "TERM_PROGRAM"),
+        Some(Some("WarpTerminal".to_owned()))
+    );
+}
+
+#[test]
+fn without_base_env_the_environment_is_inherited() {
+    let command = build_host_shell_command(
+        shell_starter(ShellType::Zsh, "/bin/zsh"),
+        None,
+        HashMap::new(),
+        None,
+        false,
+        false,
+        false,
+        false,
+        true,
+        None,
+    );
+
+    assert_eq!(env_value(&command, "EXAMPLE_BASE"), None);
+    assert_eq!(
+        env_value(&command, "HOME").flatten(),
+        std::env::var("HOME").ok()
+    );
+}
+
+#[test]
+fn spawned_shell_gets_the_base_env_and_child_rlimits() {
+    let mut nofile = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `nofile` is valid for writes.
+    unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut nofile) };
+    let wanted_nofile: u64 = 200.min(nofile.rlim_max);
+    assert!(std::env::var_os("CARGO_MANIFEST_DIR").is_some());
+    let home = std::env::temp_dir();
+    let mut options = crate::local_tty::server::test_util::sh_options(
+        "printf 'base=%s;inherited=%s;nofile=%s;core=%s;\\n' \"$EXAMPLE_BASE\" \"${CARGO_MANIFEST_DIR-unset}\" \"$(ulimit -n)\" \"$(ulimit -c)\"",
+    );
+    options.base_env = Some(vec![
+        ("HOME".into(), home.into_os_string()),
+        ("EXAMPLE_BASE".into(), "from-base".into()),
+    ]);
+    options.child_rlimits = Some(ChildResourceLimits {
+        nofile_soft: wanted_nofile,
+        core_soft: 0,
+    });
+    let info = spawn(options).unwrap();
+    let mut leader = unsafe { File::from_raw_fd(info.result.leader_fd) };
+    let mut output = Vec::new();
+    let mut buf = [0u8; 1024];
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !output.ends_with(b";\r\n") && Instant::now() < deadline {
+        if !wait_readable(leader.as_raw_fd(), Duration::from_millis(100)) {
+            continue;
+        }
+        match io::Read::read(&mut leader, &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => output.extend_from_slice(&buf[..n]),
+        }
+    }
+    let mut child = info.child;
+    let _ = child.wait();
+    let output = String::from_utf8_lossy(&output).into_owned();
+
+    assert!(output.contains("base=from-base;"), "{output}");
+    assert!(output.contains("inherited=unset;"), "{output}");
+    assert!(
+        output.contains(&format!("nofile={wanted_nofile};")),
+        "{output}"
+    );
+    assert!(output.contains("core=0;"), "{output}");
 }

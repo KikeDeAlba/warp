@@ -1417,6 +1417,8 @@ impl<S> TerminalManager<S> {
             honor_ps1: is_honor_ps1_enabled,
             node_version_chip_enabled,
             close_fds: true,
+            base_env: None,
+            child_rlimits: None,
         };
 
         let hooks = AppPtySpawnHooks {
