@@ -2410,8 +2410,29 @@ fn cloud_mode_setup_phase_ended_does_not_emit_when_not_sharing() {
     assert!(events.is_empty());
 }
 
+/// Encodes a hook the way the terminal daemon stores and replays it: hex JSON
+/// terminated by the 7-bit `ESC \` string terminator.
+fn daemon_replayed_dcs(payload: &str) -> Vec<u8> {
+    let mut bytes = b"\x1bP$d".to_vec();
+    bytes.extend(hex::encode(payload).bytes());
+    bytes.extend_from_slice(b"\x1b\\");
+    bytes
+}
+
 #[test]
 fn reattached_session_replay_rebuilds_bootstrapped_running_block() {
+    assert_replay_rebuilds_bootstrapped_running_block(hex_encoded_json_dcs);
+}
+
+#[test]
+fn daemon_shaped_replay_rebuilds_bootstrapped_running_block() {
+    assert_replay_rebuilds_bootstrapped_running_block(daemon_replayed_dcs);
+}
+
+/// The replay is the daemon's bootstrap preamble (`InitShell` and
+/// `Bootstrapped`) followed by the body, which starts at the `CommandFinished`
+/// hook right before the last `Precmd`.
+fn assert_replay_rebuilds_bootstrapped_running_block(encode: fn(&str) -> Vec<u8>) {
     let (events_tx, events_rx) = async_channel::unbounded::<crate::terminal::event::Event>();
     let event_proxy = ChannelEventListener::builder_for_test()
         .with_terminal_events_tx(events_tx)
@@ -2442,19 +2463,19 @@ fn reattached_session_replay_rebuilds_bootstrapped_running_block() {
     let hook_session_id = 4242u64;
     terminal.register_session_id(SessionId::from(hook_session_id));
 
-    let mut replay = hex_encoded_json_dcs(&format!(
+    let mut replay = encode(&format!(
         r#"{{"hook": "InitShell", "value": {{"session_id": {hook_session_id}, "shell": "zsh", "user": "demo", "hostname": "example"}}}}"#
     ));
-    replay.extend(hex_encoded_json_dcs(&format!(
+    replay.extend(encode(&format!(
         r#"{{"hook": "Bootstrapped", "value": {{"histfile": "", "session_id": {hook_session_id}, "shell": "zsh", "home_dir": "/home/demo", "path": "/usr/bin", "env_var_names": "", "aliases": "", "abbreviations": "", "function_names": "", "builtins": "", "keywords": "", "shell_version": "5.9"}}}}"#
     )));
-    replay.extend(hex_encoded_json_dcs(&format!(
+    replay.extend(encode(&format!(
         r#"{{"hook": "CommandFinished", "value": {{"exit_code": 0, "next_block_id": "precmd-{hook_session_id}-7", "session_id": {hook_session_id}}}}}"#
     )));
-    replay.extend(hex_encoded_json_dcs(&format!(
+    replay.extend(encode(&format!(
         r#"{{"hook": "Precmd", "value": {{"exit_code": 0, "next_block_id": "precmd-{hook_session_id}-7", "pwd": "/home/demo", "ps1": "", "session_id": {hook_session_id}}}}}"#
     )));
-    replay.extend(hex_encoded_json_dcs(&format!(
+    replay.extend(encode(&format!(
         r#"{{"hook": "Preexec", "value": {{"command": "sleep 100", "session_id": {hook_session_id}}}}}"#
     )));
     replay.extend_from_slice(b"tick 1\r\ntick 2\r\n");
