@@ -88,6 +88,9 @@ pub struct PtyController<T: EventLoopSender> {
     bootstrap_file: Option<TempBootstrapFile>,
     in_flight_native_completions_results_tx:
         Option<async_channel::Sender<(Vec<ShellCompletion>, Option<Span>)>>,
+    /// Set when reattaching to a shell that is already bootstrapped, so the
+    /// replayed `InitShell` hook does not write the bootstrap script again.
+    skip_next_bootstrap_write: bool,
 }
 
 impl<T: EventLoopSender> PtyController<T> {
@@ -186,7 +189,13 @@ impl<T: EventLoopSender> PtyController<T> {
             #[cfg(not(target_family = "wasm"))]
             bootstrap_file: None,
             in_flight_native_completions_results_tx: None,
+            skip_next_bootstrap_write: false,
         }
+    }
+
+    /// Skips the bootstrap script write triggered by the next `InitShell` hook.
+    pub fn skip_next_bootstrap_write(&mut self) {
+        self.skip_next_bootstrap_write = true;
     }
 
     /// Sends bindkey to notify shell process to switch to PS1 logic for prompt
@@ -327,6 +336,10 @@ impl<T: EventLoopSender> PtyController<T> {
         pending_session_info: &SessionInfo,
         ctx: &mut ModelContext<Self>,
     ) {
+        if std::mem::take(&mut self.skip_next_bootstrap_write) {
+            log::info!("Skipping bootstrap script write for reattached session");
+            return;
+        }
         let shell_type = pending_session_info.shell.shell_type();
 
         #[cfg(feature = "local_fs")]

@@ -265,3 +265,45 @@ fn rejected_queued_in_band_start_is_cancelled_without_writing_bytes() {
         drop(model_events_tx);
     });
 }
+
+#[test]
+fn skip_next_bootstrap_write_skips_only_one_init_shell() {
+    App::test((), |mut app| async move {
+        let model = terminal_model();
+        let (model_events_tx, model_events_rx) = async_channel::unbounded();
+        let (_executor_command_tx, executor_command_rx) = async_channel::unbounded();
+        let sessions = app.add_model(|_| Sessions::new_for_test());
+        let model_events =
+            app.add_model(|ctx| ModelEventDispatcher::new(model_events_rx, sessions.clone(), ctx));
+        let line_editor_status =
+            app.add_model(|ctx| LineEditorStatus::new(model_events.clone(), sessions.clone(), ctx));
+        let sender = TestEventLoopSender::default();
+        let controller = app.add_model(|ctx| {
+            PtyController::new(
+                sender.clone(),
+                model_events,
+                line_editor_status,
+                sessions,
+                executor_command_rx,
+                model.clone(),
+                ctx,
+            )
+        });
+        let session_info = SessionInfo::new_for_test()
+            .with_id(SessionId::from(4242))
+            .with_shell_type(ShellType::Bash);
+
+        controller.update(&mut app, |controller, ctx| {
+            controller.skip_next_bootstrap_write();
+            controller.initialize_shell(&session_info, ctx);
+        });
+        assert!(sender.messages.lock().is_empty());
+
+        controller.update(&mut app, |controller, ctx| {
+            controller.initialize_shell(&session_info, ctx);
+        });
+        assert!(!sender.messages.lock().is_empty());
+
+        drop(model_events_tx);
+    });
+}
