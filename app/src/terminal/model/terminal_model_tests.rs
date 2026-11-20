@@ -2409,3 +2409,81 @@ fn cloud_mode_setup_phase_ended_does_not_emit_when_not_sharing() {
     let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
     assert!(events.is_empty());
 }
+
+#[test]
+fn reattached_session_replay_rebuilds_bootstrapped_running_block() {
+    let (events_tx, events_rx) = async_channel::unbounded::<crate::terminal::event::Event>();
+    let event_proxy = ChannelEventListener::builder_for_test()
+        .with_terminal_events_tx(events_tx)
+        .build();
+    let restored_blocks = [create_default_serialized_block().into()];
+    let mut terminal = TerminalModel::new(
+        Some(&restored_blocks),
+        block_size(),
+        color::List::from(&color::Colors::default()),
+        event_proxy,
+        Arc::new(Background::default()),
+        false,
+        false,
+        false,
+        false,
+        false,
+        ObfuscateSecrets::No,
+        false,
+        None,
+        ShellLaunchState::DeterminingShell {
+            available_shell: None,
+            display_name: ShellName::blank(),
+        },
+    );
+    assert!(!terminal.block_list().is_bootstrapped());
+    terminal.set_login_shell_spawned(ShellType::Zsh);
+
+    let hook_session_id = 4242u64;
+    terminal.register_session_id(SessionId::from(hook_session_id));
+
+    let mut replay = hex_encoded_json_dcs(&format!(
+        r#"{{"hook": "InitShell", "value": {{"session_id": {hook_session_id}, "shell": "zsh", "user": "demo", "hostname": "example"}}}}"#
+    ));
+    replay.extend(hex_encoded_json_dcs(&format!(
+        r#"{{"hook": "Bootstrapped", "value": {{"histfile": "", "session_id": {hook_session_id}, "shell": "zsh", "home_dir": "/home/demo", "path": "/usr/bin", "env_var_names": "", "aliases": "", "abbreviations": "", "function_names": "", "builtins": "", "keywords": "", "shell_version": "5.9"}}}}"#
+    )));
+    replay.extend(hex_encoded_json_dcs(&format!(
+        r#"{{"hook": "CommandFinished", "value": {{"exit_code": 0, "next_block_id": "precmd-{hook_session_id}-7", "session_id": {hook_session_id}}}}}"#
+    )));
+    replay.extend(hex_encoded_json_dcs(&format!(
+        r#"{{"hook": "Precmd", "value": {{"exit_code": 0, "next_block_id": "precmd-{hook_session_id}-7", "pwd": "/home/demo", "ps1": "", "session_id": {hook_session_id}}}}}"#
+    )));
+    replay.extend(hex_encoded_json_dcs(&format!(
+        r#"{{"hook": "Preexec", "value": {{"command": "sleep 100", "session_id": {hook_session_id}}}}}"#
+    )));
+    replay.extend_from_slice(b"tick 1\r\ntick 2\r\n");
+
+    let mut replies = Vec::new();
+    Processor::new().parse_bytes(&mut terminal, &replay, &mut replies);
+
+    assert!(replies.is_empty());
+    assert!(terminal.block_list().is_bootstrapped());
+    assert!(terminal.is_active_block_bootstrapped());
+    let active_block = terminal.block_list().active_block();
+    assert_eq!(active_block.state(), BlockState::Executing);
+    assert!(active_block.output_to_string().contains("tick 1"));
+    assert!(active_block.output_to_string().contains("tick 2"));
+
+    let handler_events: Vec<_> = std::iter::from_fn(|| events_rx.try_recv().ok())
+        .filter_map(|event| match event {
+            crate::terminal::event::Event::Handler(event) => Some(event),
+            _ => None,
+        })
+        .collect();
+    assert!(handler_events.iter().any(|event| matches!(
+        event,
+        HandlerEvent::InitShell { pending_session_info }
+            if pending_session_info.session_id == SessionId::from(hook_session_id)
+    )));
+    assert!(handler_events.iter().any(|event| matches!(
+        event,
+        HandlerEvent::Bootstrapped(bootstrapped)
+            if bootstrapped.session_info.session_id == SessionId::from(hook_session_id)
+    )));
+}

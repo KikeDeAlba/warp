@@ -127,3 +127,122 @@ fn normal_shutdown_still_exits_terminal() {
     assert!(killed);
     assert!(terminal.lock().is_read_only());
 }
+
+#[cfg(unix)]
+struct ReplayPty {
+    stream: std::os::unix::net::UnixStream,
+    replay: Option<Vec<u8>>,
+}
+
+#[cfg(unix)]
+impl EventedReadWrite for ReplayPty {
+    type Reader = std::os::unix::net::UnixStream;
+    type Writer = std::os::unix::net::UnixStream;
+
+    fn register(&mut self, poll: &mio::Poll, interest: Interest) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        poll.registry().register(
+            &mut mio::unix::SourceFd(&self.stream.as_raw_fd()),
+            PTY_TOKEN,
+            interest,
+        )
+    }
+
+    fn reregister(&mut self, poll: &mio::Poll, interest: Interest) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        poll.registry().reregister(
+            &mut mio::unix::SourceFd(&self.stream.as_raw_fd()),
+            PTY_TOKEN,
+            interest,
+        )
+    }
+
+    fn deregister(&mut self, poll: &mio::Poll) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        poll.registry()
+            .deregister(&mut mio::unix::SourceFd(&self.stream.as_raw_fd()))
+    }
+
+    fn reader(&mut self) -> &mut Self::Reader {
+        &mut self.stream
+    }
+
+    fn writer(&mut self) -> &mut Self::Writer {
+        &mut self.stream
+    }
+
+    fn read_token(&self) -> mio::Token {
+        PTY_TOKEN
+    }
+
+    fn write_token(&self) -> mio::Token {
+        PTY_TOKEN
+    }
+}
+
+#[cfg(unix)]
+impl EventedPty for ReplayPty {
+    fn child_event_token(&self) -> mio::Token {
+        SIGNALS_TOKEN
+    }
+
+    fn next_child_event(&mut self) -> Option<ChildEvent> {
+        None
+    }
+
+    fn on_resize(&mut self, _: &SizeInfo) {}
+
+    fn kill(self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn take_replay(&mut self) -> Option<Vec<u8>> {
+        self.replay.take()
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn replay_is_processed_before_live_bytes_without_answering_queries() {
+    use std::io::{Read as _, Write as _};
+
+    let mut model = TerminalModel::mock(None, None);
+    model.simulate_long_running_block("watch", "");
+    let terminal = Arc::new(FairMutex::new(model));
+    let (stream, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    stream.set_nonblocking(true).unwrap();
+    let (sender, receiver) = mio_channel::channel();
+    let handle = EventLoop::new(
+        terminal.clone(),
+        ChannelEventListener::new_for_test(),
+        ReplayPty {
+            stream,
+            replay: Some(b"\x1b[cbefore\r\n".to_vec()),
+        },
+        receiver,
+    )
+    .spawn();
+
+    peer.write_all(b"after\r\n").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let output = terminal
+            .lock()
+            .block_list()
+            .active_block()
+            .output_to_string();
+        if output.contains("after") {
+            let before = output.find("before").expect("replay should be processed");
+            assert!(before < output.find("after").unwrap());
+            break;
+        }
+        assert!(Instant::now() < deadline, "live bytes were not processed");
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    sender.send(Message::Shutdown).unwrap();
+    handle.join().unwrap();
+    let mut written_to_pty = Vec::new();
+    peer.read_to_end(&mut written_to_pty).unwrap();
+    assert!(written_to_pty.is_empty());
+}

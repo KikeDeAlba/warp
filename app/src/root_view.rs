@@ -916,6 +916,55 @@ fn open_from_restored(arg: &OpenFromRestoredArg, ctx: &mut AppContext) {
             }
         }
     }
+
+    #[cfg(all(feature = "local_tty", unix))]
+    prune_persistent_sessions(arg.app_state.as_ref(), ctx);
+}
+
+/// Kills daemon sessions that no restored terminal pane will reattach to.
+#[cfg(all(feature = "local_tty", unix))]
+fn prune_persistent_sessions(app_state: Option<&crate::app_state::AppState>, ctx: &mut AppContext) {
+    let keep = if GeneralSettings::as_ref(ctx).should_persist_sessions() {
+        app_state
+            .map(|app_state| {
+                let mut uuids = Vec::new();
+                for window in &app_state.windows {
+                    for tab in &window.tabs {
+                        collect_terminal_session_ids(&tab.root, &mut uuids);
+                    }
+                }
+                uuids
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    crate::terminal::local_tty::spawner::PtySpawner::handle(ctx).update(ctx, |pty_spawner, _| {
+        pty_spawner.prune_persistent_sessions(keep);
+    });
+}
+
+#[cfg(all(feature = "local_tty", unix))]
+fn collect_terminal_session_ids(
+    node: &crate::app_state::PaneNodeSnapshot,
+    uuids: &mut Vec<crate::terminal::local_tty::server::PersistentSessionId>,
+) {
+    use crate::app_state::{LeafContents, PaneNodeSnapshot};
+
+    match node {
+        PaneNodeSnapshot::Branch(branch) => {
+            for (_, child) in &branch.children {
+                collect_terminal_session_ids(child, uuids);
+            }
+        }
+        PaneNodeSnapshot::Leaf(leaf) => {
+            if let LeafContents::Terminal(terminal) = &leaf.contents
+                && let Ok(uuid) = uuid::Uuid::from_slice(&terminal.uuid)
+            {
+                uuids.push(uuid.into());
+            }
+        }
+    }
 }
 
 fn path_if_directory(path: &Path) -> Option<&Path> {

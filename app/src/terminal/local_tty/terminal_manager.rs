@@ -48,6 +48,7 @@ use crate::settings::{DebugSettings, PrivacySettings, SshSettings};
 use crate::terminal::available_shells::{AvailableShell, AvailableShells};
 use crate::terminal::color::List as ColorList;
 use crate::terminal::event_listener::ChannelEventListener;
+use crate::terminal::general_settings::GeneralSettings;
 #[cfg(unix)]
 use crate::terminal::local_tty::terminal_attributes::Event as TerminalAttributesPollerEvent;
 use crate::terminal::local_tty::{Pty, PtyOptions};
@@ -308,6 +309,7 @@ impl<S> TerminalManager<S> {
         initial_size: Vector2F,
         model_event_sender: Option<SyncSender<ModelEvent>>,
         chosen_shell: Option<AvailableShell>,
+        persistent_session_id: Option<Uuid>,
         ctx: &mut AppContext,
         create_surface: impl FnOnce(
             TerminalSurfaceInit,
@@ -329,6 +331,7 @@ impl<S> TerminalManager<S> {
             initial_size,
             model_event_sender,
             chosen_shell,
+            persistent_session_id,
             BlockSpacing::for_gui(ctx),
             SshRemoteServerSupport::Enabled,
             ctx,
@@ -370,6 +373,7 @@ impl<S> TerminalManager<S> {
             initial_size,
             model_event_sender,
             chosen_shell,
+            None,
             block_spacing,
             SshRemoteServerSupport::Disabled,
             ctx,
@@ -389,6 +393,7 @@ impl<S> TerminalManager<S> {
         initial_size: Vector2F,
         model_event_sender: Option<SyncSender<ModelEvent>>,
         chosen_shell: Option<AvailableShell>,
+        persistent_session_id: Option<Uuid>,
         block_spacing: BlockSpacing,
         ssh_remote_server_support: SshRemoteServerSupport,
         ctx: &mut AppContext,
@@ -611,6 +616,7 @@ impl<S> TerminalManager<S> {
                         user_default_shell_unsupported_banner_model_handle,
                         shell_startup_resources,
                         shell_starter_source,
+                        persistent_session_id,
                         ctx,
                     )
                 },
@@ -902,6 +908,7 @@ impl<S> TerminalManager<S> {
                     replacement_starter,
                     env_vars,
                     model.clone(),
+                    None,
                     #[cfg(windows)]
                     self.event_loop_tx.clone(),
                     ctx,
@@ -1017,6 +1024,7 @@ fn on_shell_determined<S: TerminalSurface>(
     user_default_shell_unsupported_banner_model_handle: ModelHandle<BannerState>,
     shell_startup_resources: ShellStartupResources,
     shell_starter_source: Option<ShellStarterSource>,
+    persistent_session_id: Option<Uuid>,
     ctx: &mut ModelContext<Box<dyn TerminalManagerTrait>>,
 ) where
     <S as Entity>::Event: PtyIntentEvent,
@@ -1072,10 +1080,34 @@ fn on_shell_determined<S: TerminalSurface>(
         })
     }
 
+    let persistent_session_id = persistent_session_id.filter(|_| {
+        matches!(shell_starter, ShellStarter::Direct(_))
+            && GeneralSettings::as_ref(ctx).should_persist_sessions()
+    });
+    #[cfg(unix)]
+    let attached_pty = persistent_session_id.and_then(|session_id| {
+        let size = manager.model().lock().block_list().size().to_owned();
+        Pty::attach_persistent(session_id.into(), &size, ctx)
+    });
+    #[cfg(not(unix))]
+    let attached_pty: Option<Pty> = None;
+    #[cfg(unix)]
+    let attached_metadata = attached_pty
+        .as_ref()
+        .and_then(|pty| pty.attach_info())
+        .map(|info| info.metadata.clone());
+
+    #[cfg(unix)]
+    let login_shell_type = attached_metadata
+        .as_ref()
+        .and_then(|metadata| crate::terminal::shell::ShellType::from_name(&metadata.shell_type))
+        .unwrap_or_else(|| shell_starter.shell_type());
+    #[cfg(not(unix))]
+    let login_shell_type = shell_starter.shell_type();
     manager
         .model()
         .lock()
-        .set_login_shell_spawned(shell_starter.shell_type());
+        .set_login_shell_spawned(login_shell_type);
 
     let shell_launch_data = shell_starter.launch_data();
 
@@ -1088,11 +1120,16 @@ fn on_shell_determined<S: TerminalSurface>(
     // Register the session ID that was generated during shell starter construction.
     // For bash, fish, and PowerShell, the session ID is already baked into the command
     // args. For zsh and MSYS2, enqueue_init_script injects this same ID.
+    // A reattached shell keeps the ID it was bootstrapped with.
     let generated_session_id = shell_starter.session_id();
-    manager
-        .model()
-        .lock()
-        .register_session_id(generated_session_id);
+    #[cfg(unix)]
+    let hook_session_id = attached_metadata
+        .as_ref()
+        .map(|metadata| SessionId::from(metadata.hook_session_id))
+        .unwrap_or(generated_session_id);
+    #[cfg(not(unix))]
+    let hook_session_id = generated_session_id;
+    manager.model().lock().register_session_id(hook_session_id);
 
     // Enqueue the init shell script (for shells that need it), then create
     // the PTY and start its corresponding event loop.
@@ -1112,20 +1149,30 @@ fn on_shell_determined<S: TerminalSurface>(
     let model = manager.model();
     #[cfg(windows)]
     let event_loop_tx = manager.event_loop_tx.clone();
-    let pty = match manager
-        .enqueue_init_script(&shell_starter, generated_session_id)
-        .context("Failed to write shell init script to the pty")
-        .and_then(|_| {
-            TerminalManager::<S>::create_pty(
-                startup_directory,
-                shell_starter,
-                env_vars,
-                model.clone(),
-                #[cfg(windows)]
-                event_loop_tx,
-                ctx,
-            )
-        }) {
+    let pty_result = match attached_pty {
+        Some(pty) => {
+            manager.pty_controller.update(ctx, |pty_controller, _| {
+                pty_controller.skip_next_bootstrap_write();
+            });
+            Ok(pty)
+        }
+        None => manager
+            .enqueue_init_script(&shell_starter, generated_session_id)
+            .context("Failed to write shell init script to the pty")
+            .and_then(|_| {
+                TerminalManager::<S>::create_pty(
+                    startup_directory,
+                    shell_starter,
+                    env_vars,
+                    model.clone(),
+                    persistent_session_id,
+                    #[cfg(windows)]
+                    event_loop_tx,
+                    ctx,
+                )
+            }),
+    };
+    let pty = match pty_result {
         Ok(pty) => pty,
         Err(err) => {
             report_error!(&err);
@@ -1230,6 +1277,7 @@ impl<S> TerminalManager<S> {
         shell_starter: ShellStarter,
         env_vars: HashMap<OsString, OsString>,
         model: Arc<FairMutex<TerminalModel>>,
+        #[cfg_attr(not(unix), allow(unused_variables))] persistent_session_id: Option<Uuid>,
         #[cfg(windows)] event_loop_tx: mio_channel::Sender<Message>,
         ctx: &mut AppContext,
     ) -> anyhow::Result<Pty> {
@@ -1293,6 +1341,19 @@ impl<S> TerminalManager<S> {
         let hooks = AppPtySpawnHooks {
             is_crash_reporting_enabled,
         };
+        #[cfg(unix)]
+        if let Some(session_id) = persistent_session_id {
+            let metadata = warp_terminal::local_tty::server::SessionMetadata {
+                hook_session_id: options.shell_starter.session_id().as_u64(),
+                shell_type: options.shell_starter.shell_type().name().to_owned(),
+            };
+            match Pty::spawn_persistent(session_id.into(), metadata, options.clone(), &hooks, ctx) {
+                Ok(pty) => return Ok(pty),
+                Err(err) => log::warn!(
+                    "Failed to spawn persistent session, falling back to a regular shell: {err:#}"
+                ),
+            }
+        }
         Pty::new(
             options,
             &hooks,

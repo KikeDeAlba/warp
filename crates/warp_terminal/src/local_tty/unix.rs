@@ -9,10 +9,12 @@ use std::mem::MaybeUninit;
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use std::{io, ptr};
 
 use anyhow::{Context as _, Error, Result};
 use command::blocking::Command;
+use instant::Instant;
 use itertools::Itertools;
 use libc::{self, TIOCSCTTY, c_int, winsize};
 use mio::Interest;
@@ -27,10 +29,13 @@ use warp_core::cli_agent_protocol::{
 };
 use warp_core::features::FeatureFlag;
 use warp_core::safe_error;
-use warp_errors::report_if_error;
+use warp_errors::{report_error, report_if_error};
 use warpui_core::{AppContext, SingletonEntity};
 
 use super::event_loop::{PTY_TOKEN, SIGNALS_TOKEN};
+use super::server::{
+    AttachInfo, AttachedSession, PersistentSessionId, RING_CAPACITY, SessionMetadata,
+};
 use super::spawner::{PtyHandle, PtySpawnHooks, PtySpawnInfo, PtySpawner};
 use super::{ChildEvent, EventedPty, EventedReadWrite, PtyOptions, SizeInfo};
 use crate::ASSETS;
@@ -207,10 +212,21 @@ fn parse_passwd_line(line: &str, uid: u32) -> Option<CurrentUser> {
 pub struct Pty {
     pty_handle: Box<dyn PtyHandle>,
     fd: File,
+    /// The PTY leader of a daemon-owned session, used only for ioctls. `fd` is
+    /// then a socket that carries the session bytes.
+    leader: Option<File>,
+    persistent: Option<PersistentPtyState>,
     token: mio::Token,
     signals: Signals,
     signals_token: mio::Token,
 }
+
+struct PersistentPtyState {
+    info: AttachInfo,
+    pending_replay: Option<u64>,
+}
+
+const REPLAY_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PtySpawnResult {
@@ -623,6 +639,8 @@ impl Pty {
         let mut pty = Pty {
             pty_handle,
             fd,
+            leader: None,
+            persistent: None,
             token: PTY_TOKEN,
             signals,
             signals_token: SIGNALS_TOKEN,
@@ -631,12 +649,155 @@ impl Pty {
         Ok(pty)
     }
 
+    /// Spawns a shell owned by the persistent session daemon.
+    pub fn spawn_persistent(
+        session_id: PersistentSessionId,
+        metadata: SessionMetadata,
+        options: PtyOptions,
+        hooks: &dyn PtySpawnHooks,
+        ctx: &mut AppContext,
+    ) -> Result<Self> {
+        let size = options.size;
+        // Prepare signal handling first: the daemon client raises SIGCHLD as
+        // soon as it learns the session exited.
+        let signals = Signals::new([signal_hook::consts::SIGCHLD])
+            .context("error preparing signal handling")?;
+        let session = PtySpawner::handle(ctx).update(ctx, |pty_spawner, _| {
+            pty_spawner.spawn_persistent_session(session_id, metadata, options, hooks)
+        })?;
+        Ok(Self::from_attached_with_signals(session, &size, signals))
+    }
+
+    /// Reattaches to a session that kept running in the daemon, if there is one
+    /// for `session_id` that can be resumed without bootstrapping it again.
+    pub fn attach_persistent(
+        session_id: PersistentSessionId,
+        size: &SizeInfo,
+        ctx: &mut AppContext,
+    ) -> Option<Self> {
+        // Prepare signal handling first: attaching to an exited session raises
+        // SIGCHLD right away.
+        let signals = match Signals::new([signal_hook::consts::SIGCHLD]) {
+            Ok(signals) => signals,
+            Err(err) => {
+                report_error!(
+                    anyhow::Error::from(err)
+                        .context("Failed to prepare signal handling for persistent session")
+                );
+                return None;
+            }
+        };
+        let session = PtySpawner::handle(ctx).update(ctx, |pty_spawner, _| {
+            pty_spawner.attach_persistent_session(session_id)
+        })?;
+        Some(Self::from_attached_with_signals(session, size, signals))
+    }
+
+    /// Wraps a session handed over by the daemon.
+    pub fn from_attached(session: AttachedSession, size: &SizeInfo) -> Result<Self> {
+        let signals = Signals::new([signal_hook::consts::SIGCHLD])
+            .context("error preparing signal handling")?;
+        Ok(Self::from_attached_with_signals(session, size, signals))
+    }
+
+    fn from_attached_with_signals(
+        session: AttachedSession,
+        size: &SizeInfo,
+        signals: Signals,
+    ) -> Self {
+        let AttachedSession {
+            info,
+            data,
+            leader,
+            handle,
+        } = session;
+        let fd = File::from(data);
+        unsafe { set_nonblocking(fd.as_raw_fd()) };
+        let pending_replay = (info.replay_len > 0).then_some(info.replay_len);
+        let mut pty = Pty {
+            pty_handle: handle,
+            fd,
+            leader: leader.map(File::from),
+            persistent: Some(PersistentPtyState {
+                info,
+                pending_replay,
+            }),
+            token: PTY_TOKEN,
+            signals,
+            signals_token: SIGNALS_TOKEN,
+        };
+        if pending_replay.is_some() && size.columns > 1 {
+            let mut narrower = *size;
+            narrower.columns -= 1;
+            pty.on_resize(&narrower);
+        }
+        pty.on_resize(size);
+        pty
+    }
+
     pub fn get_pid(&self) -> u32 {
         self.pty_handle.pid()
     }
 
+    /// Returns the fd to use for terminal ioctls (`TIOCSWINSZ`, `tcgetattr`,
+    /// `tcgetpgrp`).
     pub fn get_fd(&self) -> RawFd {
-        self.fd.as_raw_fd()
+        self.leader.as_ref().unwrap_or(&self.fd).as_raw_fd()
+    }
+
+    /// Returns the daemon's description of the session, if this PTY is owned by
+    /// the persistent session daemon.
+    pub fn attach_info(&self) -> Option<&AttachInfo> {
+        self.persistent.as_ref().map(|state| &state.info)
+    }
+
+    fn read_replay(&mut self, len: u64) -> Vec<u8> {
+        let mut replay = Vec::with_capacity(len.min(RING_CAPACITY as u64 * 2) as usize);
+        let deadline = Instant::now() + REPLAY_READ_TIMEOUT;
+        let mut buf = [0u8; 0x1_0000];
+        while (replay.len() as u64) < len {
+            let remaining = (len - replay.len() as u64).min(buf.len() as u64) as usize;
+            match io::Read::read(&mut self.fd, &mut buf[..remaining]) {
+                Ok(0) => break,
+                Ok(n) => replay.extend_from_slice(&buf[..n]),
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    let now = Instant::now();
+                    if now >= deadline || !wait_readable(self.fd.as_raw_fd(), deadline - now) {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    log::warn!("Failed to read session replay: {err}");
+                    break;
+                }
+            }
+        }
+        if (replay.len() as u64) < len {
+            log::warn!(
+                "Read {} of {len} replay bytes for reattached session",
+                replay.len()
+            );
+        }
+        replay
+    }
+}
+
+fn wait_readable(fd: RawFd, timeout: Duration) -> bool {
+    let mut pollfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let timeout_ms = timeout.as_millis().clamp(1, c_int::MAX as u128) as c_int;
+    loop {
+        let res = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+        if res >= 0 {
+            return res > 0;
+        }
+        if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            return false;
+        }
     }
 }
 
@@ -717,7 +878,24 @@ impl EventedPty for Pty {
     fn on_resize(&mut self, size: &SizeInfo) {
         let win = size.to_winsize();
 
-        let res = unsafe { libc::ioctl(self.fd.as_raw_fd(), libc::TIOCSWINSZ, &win as *const _) };
+        if self.persistent.is_some() {
+            // A daemon-owned session may have exited, in which case there is no
+            // leader (or it no longer accepts ioctls).
+            let Some(leader) = &self.leader else {
+                return;
+            };
+            let res =
+                unsafe { libc::ioctl(leader.as_raw_fd(), libc::TIOCSWINSZ, &win as *const _) };
+            if res < 0 {
+                log::warn!(
+                    "ioctl TIOCSWINSZ failed for persistent session: {}",
+                    io::Error::last_os_error()
+                );
+            }
+            return;
+        }
+
+        let res = unsafe { libc::ioctl(self.get_fd(), libc::TIOCSWINSZ, &win as *const _) };
 
         if res < 0 {
             panic!("ioctl TIOCSWINSZ failed: {}", io::Error::last_os_error());
@@ -730,9 +908,15 @@ impl EventedPty for Pty {
         // hang. Closing the pty explicitly fixes it, though the reason is unclear;
         // it appears to be a kernel bug.
         std::mem::drop(self.fd);
+        std::mem::drop(self.leader);
         let result = self.pty_handle.kill();
         report_if_error!(result);
         result
+    }
+
+    fn take_replay(&mut self) -> Option<Vec<u8>> {
+        let len = self.persistent.as_mut()?.pending_replay.take()?;
+        Some(self.read_replay(len))
     }
 }
 
