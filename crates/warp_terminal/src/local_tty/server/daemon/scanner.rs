@@ -14,6 +14,7 @@ const JSON_MARKER: u8 = b'f';
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum HookKind {
+    CommandFinished,
     Precmd,
     Preexec,
     InitShell { is_subshell: bool },
@@ -203,6 +204,7 @@ fn parse_payload(marker: u8, payload: &[u8]) -> Option<(HookKind, Option<u64>)> 
     let hook: RawHook = serde_json::from_slice(json).ok()?;
     let value = hook.value.unwrap_or_default();
     let kind = match hook.hook.as_str() {
+        "CommandFinished" => HookKind::CommandFinished,
         "Precmd" => HookKind::Precmd,
         "Preexec" => HookKind::Preexec,
         "InitShell" => HookKind::InitShell {

@@ -72,14 +72,27 @@ pub(super) struct Replay {
     pub has_bootstrap_preamble: bool,
 }
 
+/// A prompt boundary: the `CommandFinished` hook that immediately precedes a
+/// `Precmd` (if any) and the `Precmd` itself.
+#[derive(Debug, Clone)]
+struct Prompt {
+    /// Where a replay of this prompt starts: the `CommandFinished` offset, or
+    /// the `Precmd` offset if there was none.
+    start: u64,
+    precmd_offset: u64,
+    /// The raw `CommandFinished` (if any) followed by the raw `Precmd`.
+    raw: Vec<u8>,
+}
+
 /// The output history of one session.
 pub(super) struct History {
     ring: Ring,
     scanner: DcsScanner,
     hook_session_id: u64,
     hooks: Vec<Hook>,
-    precmd_offsets: VecDeque<u64>,
-    last_precmd: Option<RawHook>,
+    prompt_starts: VecDeque<u64>,
+    pending_command_finished: Option<RawHook>,
+    last_prompt: Option<Prompt>,
     last_preexec: Option<RawHook>,
     pending_init_shell: Option<RawHook>,
     preamble: Option<RawHook>,
@@ -93,8 +106,9 @@ impl History {
             scanner: DcsScanner::new(),
             hook_session_id,
             hooks: Vec::new(),
-            precmd_offsets: VecDeque::new(),
-            last_precmd: None,
+            prompt_starts: VecDeque::new(),
+            pending_command_finished: None,
+            last_prompt: None,
             last_preexec: None,
             pending_init_shell: None,
             preamble: None,
@@ -110,8 +124,8 @@ impl History {
             self.on_hook(hook);
         }
         let start = self.ring.start();
-        while self.precmd_offsets.front().is_some_and(|o| *o < start) {
-            self.precmd_offsets.pop_front();
+        while self.prompt_starts.front().is_some_and(|o| *o < start) {
+            self.prompt_starts.pop_front();
         }
     }
 
@@ -121,11 +135,30 @@ impl History {
             raw: hook.raw,
         };
         match hook.kind {
+            HookKind::CommandFinished => self.pending_command_finished = Some(raw),
             HookKind::Precmd => {
-                self.precmd_offsets.push_back(raw.offset);
-                self.last_precmd = Some(raw);
+                let prompt = match self.pending_command_finished.take() {
+                    Some(mut command_finished) => {
+                        command_finished.raw.extend_from_slice(&raw.raw);
+                        Prompt {
+                            start: command_finished.offset,
+                            precmd_offset: raw.offset,
+                            raw: command_finished.raw,
+                        }
+                    }
+                    None => Prompt {
+                        start: raw.offset,
+                        precmd_offset: raw.offset,
+                        raw: raw.raw,
+                    },
+                };
+                self.prompt_starts.push_back(prompt.start);
+                self.last_prompt = Some(prompt);
             }
-            HookKind::Preexec => self.last_preexec = Some(raw),
+            HookKind::Preexec => {
+                self.pending_command_finished = None;
+                self.last_preexec = Some(raw);
+            }
             HookKind::InitShell { is_subshell: false }
                 if hook.session_id == Some(self.hook_session_id) =>
             {
@@ -146,9 +179,9 @@ impl History {
     }
 
     /// Records that the client detached: the next replay starts at the last
-    /// prompt seen so far.
+    /// prompt seen so far, including the `CommandFinished` right before it.
     pub fn mark_detached(&mut self) {
-        self.replay_from = self.last_precmd.as_ref().map_or(0, |hook| hook.offset);
+        self.replay_from = self.last_prompt.as_ref().map_or(0, |prompt| prompt.start);
     }
 
     pub fn has_bootstrap_preamble(&self) -> bool {
@@ -159,19 +192,22 @@ impl History {
     /// the first of:
     /// 1. everything since `replay_from`, if still retained;
     /// 2. everything since the oldest retained prompt;
-    /// 3. the last prompt and command hooks, a truncation marker, and every
-    ///    retained byte.
+    /// 3. the last `CommandFinished`, `Precmd` and `Preexec` hooks, a
+    ///    truncation marker, and every retained byte.
+    ///
+    /// A prompt starts at the `CommandFinished` hook right before its `Precmd`
+    /// so the restored block list leaves the bootstrap block.
     pub fn replay(&self) -> Replay {
         let ring_start = self.ring.start();
         let mut prefix = Vec::new();
         let body_start = if self.replay_from >= ring_start {
             self.replay_from
-        } else if let Some(oldest) = self.precmd_offsets.front() {
+        } else if let Some(oldest) = self.prompt_starts.front() {
             *oldest
         } else {
-            let precmd_offset = self.last_precmd.as_ref().map(|hook| hook.offset);
-            if let Some(precmd) = &self.last_precmd {
-                prefix.extend_from_slice(&precmd.raw);
+            let precmd_offset = self.last_prompt.as_ref().map(|prompt| prompt.precmd_offset);
+            if let Some(prompt) = &self.last_prompt {
+                prefix.extend_from_slice(&prompt.raw);
             }
             if let Some(preexec) = &self.last_preexec
                 && precmd_offset.is_none_or(|offset| preexec.offset > offset)

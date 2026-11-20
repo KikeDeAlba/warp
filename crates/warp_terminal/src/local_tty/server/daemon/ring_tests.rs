@@ -27,6 +27,12 @@ fn precmd() -> Vec<u8> {
     ))
 }
 
+fn command_finished() -> Vec<u8> {
+    hex_hook(&format!(
+        r#"{{"hook":"CommandFinished","value":{{"exit_code":0,"session_id":{SESSION}}}}}"#
+    ))
+}
+
 fn preexec() -> Vec<u8> {
     hex_hook(r#"{"hook":"Preexec","value":{"command":"make"}}"#)
 }
@@ -57,7 +63,7 @@ fn ring_grows_lazily() {
 }
 
 #[test]
-fn precmd_offsets_are_pruned_on_eviction() {
+fn prompt_starts_are_pruned_on_eviction() {
     let precmd = precmd();
     let capacity = 3 * (precmd.len() + 8) + 10;
     let mut history = History::new(capacity, SESSION);
@@ -65,17 +71,17 @@ fn precmd_offsets_are_pruned_on_eviction() {
         history.record(&precmd);
         history.record(b"output\r\n");
     }
-    assert_eq!(history.precmd_offsets.len(), 3);
+    assert_eq!(history.prompt_starts.len(), 3);
     history.record(&vec![b'x'; precmd.len() + 20]);
-    assert!(history.precmd_offsets.len() < 3);
+    assert!(history.prompt_starts.len() < 3);
     assert!(
         history
-            .precmd_offsets
+            .prompt_starts
             .iter()
             .all(|offset| *offset >= history.ring.start())
     );
     history.record(&vec![b'y'; capacity]);
-    assert!(history.precmd_offsets.is_empty());
+    assert!(history.prompt_starts.is_empty());
 }
 
 #[test]
@@ -215,4 +221,87 @@ fn a_new_login_init_shell_replaces_the_preamble() {
     expected.extend_from_slice(&bootstrapped());
     expected.extend_from_slice(&precmd());
     assert_eq!(replay.bytes, expected);
+}
+
+#[test]
+fn replay_starts_at_the_command_finished_before_the_last_prompt() {
+    let mut history = History::new(4096, SESSION);
+    history.record(&init_shell(SESSION, false));
+    history.record(&bootstrapped());
+    history.record(&command_finished());
+    history.record(&precmd());
+    history.record(b"$ sleep 100\r\n");
+    history.record(&preexec());
+    history.record(b"tick 1\r\n");
+    history.record(&command_finished());
+    history.record(b"\r\n");
+    history.record(&precmd());
+    history.record(b"$ ");
+    history.mark_detached();
+    history.record(b"tick 2");
+
+    let mut expected = init_shell(SESSION, false);
+    expected.extend_from_slice(&bootstrapped());
+    expected.extend_from_slice(&command_finished());
+    expected.extend_from_slice(b"\r\n");
+    expected.extend_from_slice(&precmd());
+    expected.extend_from_slice(b"$ tick 2");
+    assert_eq!(history.replay().bytes, expected);
+}
+
+#[test]
+fn a_command_finished_followed_by_preexec_is_not_paired_with_the_next_prompt() {
+    let mut history = History::new(4096, SESSION);
+    history.record(&command_finished());
+    history.record(&preexec());
+    history.record(b"noise");
+    history.record(&precmd());
+    history.record(b"$ ");
+    history.mark_detached();
+
+    let mut expected = precmd();
+    expected.extend_from_slice(b"$ ");
+    assert_eq!(history.replay().bytes, expected);
+}
+
+#[test]
+fn replay_case_two_starts_at_the_oldest_retained_command_finished() {
+    let command_finished = command_finished();
+    let precmd = precmd();
+    let prompt_len = command_finished.len() + precmd.len();
+    let mut history = History::new(prompt_len * 2 + 40, SESSION);
+    history.record(&command_finished);
+    history.record(&precmd);
+    history.record(b"$ cmd one\r\n");
+    history.mark_detached();
+    history.record(&[b'.'; 30]);
+    history.record(&command_finished);
+    history.record(&precmd);
+    history.record(b"$ two");
+
+    let mut expected = command_finished.clone();
+    expected.extend_from_slice(&precmd);
+    expected.extend_from_slice(b"$ two");
+    assert_eq!(history.replay().bytes, expected);
+}
+
+#[test]
+fn replay_case_three_prepends_command_finished_before_the_prompt() {
+    let command_finished = command_finished();
+    let precmd = precmd();
+    let preexec = preexec();
+    let mut history = History::new(64, SESSION);
+    history.record(&command_finished);
+    history.record(&precmd);
+    history.record(b"$ make\r\n");
+    history.record(&preexec);
+    history.mark_detached();
+    history.record(&[b'q'; 200]);
+
+    let mut expected = command_finished.clone();
+    expected.extend_from_slice(&precmd);
+    expected.extend_from_slice(&preexec);
+    expected.extend_from_slice(TRUNCATION_MARKER);
+    expected.extend_from_slice(&[b'q'; 64]);
+    assert_eq!(history.replay().bytes, expected);
 }

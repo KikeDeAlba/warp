@@ -82,9 +82,7 @@ fn recognizes_subshell_init_and_unencoded_json() {
 fn ignores_foreign_dcs_and_unknown_hooks() {
     let mut input = b"\x1bPq#0;2;0;0;0#0~~@@\x1b\\".to_vec();
     input.extend_from_slice(b"\x1bP$qm\x1b\\");
-    input.extend_from_slice(&hex_hook(
-        r#"{"hook":"CommandFinished","value":{"exit_code":0}}"#,
-    ));
+    input.extend_from_slice(&hex_hook(r#"{"hook":"InputBuffer","value":{"buffer":""}}"#));
     input.extend_from_slice(b"\x1bP$dnot-hex\x1b\\");
     input.extend_from_slice(b"\x1b[31mred\x1b[0m");
     assert!(scan_byte_by_byte(&input).is_empty());
@@ -144,4 +142,14 @@ fn oversized_payloads_are_dropped() {
     }
     assert_eq!(hooks.len(), 1);
     assert_eq!(hooks[0].raw, precmd);
+}
+
+#[test]
+fn recognizes_command_finished() {
+    let input = hex_hook(r#"{"hook":"CommandFinished","value":{"exit_code":1,"session_id":3}}"#);
+    let hooks = scan_byte_by_byte(&input);
+    assert_eq!(hooks.len(), 1);
+    assert_eq!(hooks[0].kind, HookKind::CommandFinished);
+    assert_eq!(hooks[0].session_id, Some(3));
+    assert_eq!(hooks[0].raw, input);
 }
