@@ -286,6 +286,21 @@ where
         Ok(())
     }
 
+    /// Feeds bytes replayed from a reattached session through the parser.
+    ///
+    /// Replies to terminal queries are discarded: they were already answered
+    /// by the client that was attached when the bytes were first produced.
+    fn process_replay(&mut self, state: &mut State, replay: &[u8]) {
+        let mut discarded_replies = Vec::new();
+        for chunk in replay.chunks(MAX_LOCKED_READ) {
+            state
+                .parser
+                .parse_bytes(&mut *self.terminal.lock(), chunk, &mut discarded_replies);
+            discarded_replies.clear();
+        }
+        self.event_listener.send_wakeup_event();
+    }
+
     #[inline]
     fn pty_write(&mut self, state: &mut State, can_write: &mut bool) -> io::Result<()> {
         state.ensure_next();
@@ -344,6 +359,10 @@ where
 
                 let mut state = State::default();
                 let mut buf = [0u8; READ_BUFFER_SIZE];
+
+                if let Some(replay) = self.pty.take_replay() {
+                    self.process_replay(&mut state, &replay);
+                }
 
                 // Keep track of whether we've "drained" read and write
                 // readiness.  Once we receive a read or write readiness event,
