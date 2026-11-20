@@ -34,7 +34,15 @@ fn command_finished() -> Vec<u8> {
 }
 
 fn preexec() -> Vec<u8> {
-    hex_hook(r#"{"hook":"Preexec","value":{"command":"make"}}"#)
+    hex_hook(&format!(
+        r#"{{"hook":"Preexec","value":{{"command":"make","session_id":{SESSION}}}}}"#
+    ))
+}
+
+fn hook_for(name: &str, session_id: u64) -> Vec<u8> {
+    hex_hook(&format!(
+        r#"{{"hook":"{name}","value":{{"session_id":{session_id}}}}}"#
+    ))
 }
 
 #[test]
@@ -304,4 +312,34 @@ fn replay_case_three_prepends_command_finished_before_the_prompt() {
     expected.extend_from_slice(TRUNCATION_MARKER);
     expected.extend_from_slice(&[b'q'; 64]);
     assert_eq!(history.replay().bytes, expected);
+}
+
+#[test]
+fn hooks_from_another_session_do_not_move_the_replay_start() {
+    let mut history = History::new(4096, SESSION);
+    history.record(&command_finished());
+    history.record(&precmd());
+    history.record(b"$ ssh example.com\r\n");
+    history.record(&preexec());
+    history.record(&hook_for("CommandFinished", 99));
+    history.record(&hook_for("Precmd", 99));
+    history.record(b"remote$ ");
+    history.record(&hook_for("Preexec", 99));
+    history.mark_detached();
+
+    let mut expected = command_finished();
+    expected.extend_from_slice(&precmd());
+    expected.extend_from_slice(b"$ ssh example.com\r\n");
+    assert!(history.replay().bytes.starts_with(&expected));
+}
+
+#[test]
+fn hooks_without_a_session_id_are_ignored() {
+    let mut history = History::new(4096, SESSION);
+    history.record(b"before");
+    history.record(&hex_hook(r#"{"hook":"Precmd","value":{}}"#));
+    history.record(b"$ ");
+    history.mark_detached();
+
+    assert!(history.replay().bytes.starts_with(b"before"));
 }

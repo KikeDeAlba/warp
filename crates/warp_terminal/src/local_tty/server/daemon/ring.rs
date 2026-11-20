@@ -134,7 +134,9 @@ impl History {
             offset: hook.offset,
             raw: hook.raw,
         };
+        let own_session = hook.session_id == Some(self.hook_session_id);
         match hook.kind {
+            HookKind::CommandFinished | HookKind::Precmd | HookKind::Preexec if !own_session => {}
             HookKind::CommandFinished => self.pending_command_finished = Some(raw),
             HookKind::Precmd => {
                 let prompt = match self.pending_command_finished.take() {
@@ -159,9 +161,7 @@ impl History {
                 self.pending_command_finished = None;
                 self.last_preexec = Some(raw);
             }
-            HookKind::InitShell { is_subshell: false }
-                if hook.session_id == Some(self.hook_session_id) =>
-            {
+            HookKind::InitShell { is_subshell: false } if own_session => {
                 self.preamble = None;
                 self.pending_init_shell = Some(raw);
             }
