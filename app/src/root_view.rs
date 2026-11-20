@@ -922,26 +922,45 @@ fn open_from_restored(arg: &OpenFromRestoredArg, ctx: &mut AppContext) {
 }
 
 /// Kills daemon sessions that no restored terminal pane will reattach to.
+///
+/// Runs on a background thread, since pruning waits for the daemon to kill
+/// the sessions.
 #[cfg(all(feature = "local_tty", unix))]
 fn prune_persistent_sessions(app_state: Option<&crate::app_state::AppState>, ctx: &mut AppContext) {
-    let keep = if GeneralSettings::as_ref(ctx).should_persist_sessions() {
-        app_state
-            .map(|app_state| {
-                let mut uuids = Vec::new();
-                for window in &app_state.windows {
-                    for tab in &window.tabs {
-                        collect_terminal_session_ids(&tab.root, &mut uuids);
-                    }
-                }
-                uuids
-            })
-            .unwrap_or_default()
-    } else {
-        Vec::new()
+    let Some(keep) = persistent_sessions_to_keep(
+        app_state,
+        GeneralSettings::as_ref(ctx).should_persist_sessions(),
+    ) else {
+        return;
     };
-    crate::terminal::local_tty::spawner::PtySpawner::handle(ctx).update(ctx, |pty_spawner, _| {
-        pty_spawner.prune_persistent_sessions(keep);
-    });
+    let sessions =
+        crate::terminal::local_tty::spawner::PtySpawner::as_ref(ctx).persistent_sessions();
+    if let Err(err) = std::thread::Builder::new()
+        .name("persistent-session-prune".to_owned())
+        .spawn(move || sessions.prune(keep))
+    {
+        log::warn!("Failed to start persistent session prune thread: {err}");
+    }
+}
+
+/// Returns the daemon sessions to keep when pruning, or `None` if no snapshot
+/// was restored, in which case nothing is known about which sessions are
+/// stale and none are pruned.
+#[cfg(all(feature = "local_tty", unix))]
+fn persistent_sessions_to_keep(
+    app_state: Option<&crate::app_state::AppState>,
+    persist_sessions: bool,
+) -> Option<Vec<crate::terminal::local_tty::server::PersistentSessionId>> {
+    let app_state = app_state?;
+    let mut uuids = Vec::new();
+    if persist_sessions {
+        for window in &app_state.windows {
+            for tab in &window.tabs {
+                collect_terminal_session_ids(&tab.root, &mut uuids);
+            }
+        }
+    }
+    Some(uuids)
 }
 
 #[cfg(all(feature = "local_tty", unix))]

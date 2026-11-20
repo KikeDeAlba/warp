@@ -132,6 +132,9 @@ fn normal_shutdown_still_exits_terminal() {
 struct ReplayPty {
     stream: std::os::unix::net::UnixStream,
     replay: Option<Vec<u8>>,
+    exit_after_drain: Option<Vec<u8>>,
+    exited: bool,
+    child_events: Option<std::os::unix::net::UnixStream>,
 }
 
 #[cfg(unix)]
@@ -141,6 +144,13 @@ impl EventedReadWrite for ReplayPty {
 
     fn register(&mut self, poll: &mio::Poll, interest: Interest) -> io::Result<()> {
         use std::os::fd::AsRawFd;
+        if let Some(child_events) = &self.child_events {
+            poll.registry().register(
+                &mut mio::unix::SourceFd(&child_events.as_raw_fd()),
+                SIGNALS_TOKEN,
+                Interest::READABLE,
+            )?;
+        }
         poll.registry().register(
             &mut mio::unix::SourceFd(&self.stream.as_raw_fd()),
             PTY_TOKEN,
@@ -187,7 +197,10 @@ impl EventedPty for ReplayPty {
     }
 
     fn next_child_event(&mut self) -> Option<ChildEvent> {
-        None
+        (self.exit_after_drain.is_some() && !self.exited).then(|| {
+            self.exited = true;
+            ChildEvent::Exited(warp_terminal::event::ObservedExitStatus::Code(0))
+        })
     }
 
     fn on_resize(&mut self, _: &SizeInfo) {}
@@ -198,6 +211,10 @@ impl EventedPty for ReplayPty {
 
     fn take_replay(&mut self) -> Option<Vec<u8>> {
         self.replay.take()
+    }
+
+    fn drain_after_exit(&mut self) -> Option<Vec<u8>> {
+        self.exit_after_drain.take()
     }
 }
 
@@ -218,6 +235,9 @@ fn replay_is_processed_before_live_bytes_without_answering_queries() {
         ReplayPty {
             stream,
             replay: Some(b"\x1b[cbefore\r\n".to_vec()),
+            exit_after_drain: None,
+            exited: false,
+            child_events: None,
         },
         receiver,
     )
@@ -245,4 +265,40 @@ fn replay_is_processed_before_live_bytes_without_answering_queries() {
     let mut written_to_pty = Vec::new();
     peer.read_to_end(&mut written_to_pty).unwrap();
     assert!(written_to_pty.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn output_drained_after_exit_is_processed_before_exiting() {
+    use std::io::Write as _;
+
+    let mut model = TerminalModel::mock(None, None);
+    model.simulate_long_running_block("watch", "");
+    let terminal = Arc::new(FairMutex::new(model));
+    let (stream, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    stream.set_nonblocking(true).unwrap();
+    let (child_events, mut child_exit) = std::os::unix::net::UnixStream::pair().unwrap();
+    let (_sender, receiver) = mio_channel::channel();
+    let handle = EventLoop::new(
+        terminal.clone(),
+        ChannelEventListener::new_for_test(),
+        ReplayPty {
+            stream,
+            replay: None,
+            exit_after_drain: Some(b"final words\r\n".to_vec()),
+            exited: false,
+            child_events: Some(child_events),
+        },
+        receiver,
+    )
+    .spawn();
+
+    child_exit.write_all(b"x").unwrap();
+    handle.join().unwrap();
+    let output = terminal
+        .lock()
+        .block_list()
+        .active_block()
+        .output_to_string();
+    assert!(output.contains("final words"), "{output:?}");
 }

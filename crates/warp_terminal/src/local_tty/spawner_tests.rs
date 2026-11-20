@@ -19,6 +19,9 @@ struct FakeDaemonState {
     sessions: Vec<SessionSummary>,
     has_bootstrap_preamble: bool,
     kills: usize,
+    fail_attach: bool,
+    fail_list: bool,
+    pruned_keep: Vec<PersistentSessionId>,
 }
 
 #[derive(Clone, Default)]
@@ -51,6 +54,9 @@ impl PersistentSessionDaemon for FakeDaemon {
     fn list(&self) -> Result<Vec<SessionSummary>> {
         let mut state = self.0.lock();
         state.calls.push("list");
+        if state.fail_list {
+            bail!("list failed");
+        }
         Ok(state.sessions.clone())
     }
 
@@ -65,12 +71,21 @@ impl PersistentSessionDaemon for FakeDaemon {
     }
 
     fn attach(&self, id: PersistentSessionId) -> Result<AttachedSession> {
-        self.0.lock().calls.push("attach");
+        let fail_attach = {
+            let mut state = self.0.lock();
+            state.calls.push("attach");
+            state.fail_attach
+        };
+        if fail_attach {
+            bail!("attach failed");
+        }
         Ok(self.attached_session(id))
     }
 
-    fn prune(&self, _keep: Vec<PersistentSessionId>) -> Result<()> {
-        self.0.lock().calls.push("prune");
+    fn prune(&self, keep: Vec<PersistentSessionId>) -> Result<()> {
+        let mut state = self.0.lock();
+        state.calls.push("prune");
+        state.pruned_keep = keep;
         Ok(())
     }
 
@@ -287,12 +302,19 @@ fn dead_daemon_is_reconnected_only_once() {
     assert_eq!(connections.spawned.load(Ordering::SeqCst), 2);
 }
 
+fn attached(outcome: ReattachOutcome) -> Option<AttachedSession> {
+    match outcome {
+        ReattachOutcome::Attached(session) => Some(session),
+        ReattachOutcome::NotFound | ReattachOutcome::Failed => None,
+    }
+}
+
 #[test]
 fn prune_never_starts_a_daemon() {
     let daemon = FakeDaemon::default();
-    let (mut spawner, connections) = spawner_with(&daemon, true, false);
+    let (spawner, connections) = spawner_with(&daemon, true, false);
 
-    spawner.prune_persistent_sessions(vec![session_id(1)]);
+    spawner.persistent_sessions().prune(vec![session_id(1)]);
 
     assert_eq!(connections.spawned.load(Ordering::SeqCst), 0);
     assert_eq!(connections.existing.load(Ordering::SeqCst), 1);
@@ -302,11 +324,29 @@ fn prune_never_starts_a_daemon() {
 #[test]
 fn prune_uses_running_daemon() {
     let daemon = FakeDaemon::default();
-    let (mut spawner, _) = spawner_with(&daemon, true, true);
+    let (spawner, _) = spawner_with(&daemon, true, true);
 
-    spawner.prune_persistent_sessions(Vec::new());
+    spawner.persistent_sessions().prune(Vec::new());
 
     assert_eq!(daemon.calls(), vec!["prune"]);
+}
+
+#[test]
+fn prune_keeps_sessions_owned_by_this_run() {
+    let daemon = FakeDaemon::default();
+    daemon.0.lock().sessions = vec![summary(session_id(1))];
+    let (mut spawner, _) = spawner_with(&daemon, true, true);
+    spawner
+        .spawn_persistent_session(session_id(2), metadata(), options(), &NoopHooks)
+        .unwrap();
+    let sessions = spawner.persistent_sessions();
+    assert!(attached(sessions.reattach(session_id(1))).is_some());
+
+    sessions.prune(vec![session_id(3)]);
+
+    let mut keep = daemon.0.lock().pruned_keep.clone();
+    keep.sort_by_key(|id| id.0);
+    assert_eq!(keep, vec![session_id(1), session_id(2), session_id(3)]);
 }
 
 #[test]
@@ -317,13 +357,20 @@ fn attach_lists_sessions_once_and_skips_unknown_ids() {
         state.sessions = vec![summary(session_id(1)), summary(session_id(2))];
         state.has_bootstrap_preamble = true;
     }
-    let (mut spawner, connections) = spawner_with(&daemon, true, true);
+    let (spawner, connections) = spawner_with(&daemon, true, true);
+    let sessions = spawner.persistent_sessions();
 
-    assert!(spawner.attach_persistent_session(session_id(9)).is_none());
-    let attached = spawner.attach_persistent_session(session_id(1)).unwrap();
-    assert_eq!(attached.info.session_id, session_id(1));
-    assert!(spawner.attach_persistent_session(session_id(2)).is_some());
-    assert!(spawner.attach_persistent_session(session_id(1)).is_none());
+    assert!(matches!(
+        sessions.reattach(session_id(9)),
+        ReattachOutcome::NotFound
+    ));
+    let session = attached(sessions.reattach(session_id(1))).unwrap();
+    assert_eq!(session.info.session_id, session_id(1));
+    assert!(attached(sessions.reattach(session_id(2))).is_some());
+    assert!(matches!(
+        sessions.reattach(session_id(1)),
+        ReattachOutcome::NotFound
+    ));
 
     assert_eq!(daemon.calls(), vec!["list", "attach", "attach"]);
     assert_eq!(connections.existing.load(Ordering::SeqCst), 1);
@@ -331,24 +378,85 @@ fn attach_lists_sessions_once_and_skips_unknown_ids() {
 }
 
 #[test]
-fn attach_without_preamble_kills_session() {
+fn attach_without_preamble_keeps_session_alive() {
     let daemon = FakeDaemon::default();
     daemon.0.lock().sessions = vec![summary(session_id(1))];
-    let (mut spawner, _) = spawner_with(&daemon, true, true);
+    let (spawner, _) = spawner_with(&daemon, true, true);
 
-    assert!(spawner.attach_persistent_session(session_id(1)).is_none());
+    let session = attached(spawner.persistent_sessions().reattach(session_id(1))).unwrap();
 
+    assert!(!session.info.has_bootstrap_preamble);
     assert_eq!(daemon.calls(), vec!["list", "attach"]);
-    assert_eq!(daemon.0.lock().kills, 1);
+    assert_eq!(daemon.0.lock().kills, 0);
 }
 
 #[test]
-fn attach_without_running_daemon_returns_none() {
+fn attach_failure_leaves_session_alone() {
     let daemon = FakeDaemon::default();
-    let (mut spawner, connections) = spawner_with(&daemon, true, false);
+    {
+        let mut state = daemon.0.lock();
+        state.sessions = vec![summary(session_id(1))];
+        state.fail_attach = true;
+    }
+    let (spawner, _) = spawner_with(&daemon, true, true);
 
-    assert!(spawner.attach_persistent_session(session_id(1)).is_none());
+    assert!(matches!(
+        spawner.persistent_sessions().reattach(session_id(1)),
+        ReattachOutcome::Failed
+    ));
+
+    assert_eq!(daemon.calls(), vec!["list", "attach"]);
+    assert_eq!(daemon.0.lock().kills, 0);
+    assert!(!spawner.is_persistent_session_backed(session_id(1)));
+}
+
+#[test]
+fn list_failure_is_reported_and_retried() {
+    let daemon = FakeDaemon::default();
+    {
+        let mut state = daemon.0.lock();
+        state.sessions = vec![summary(session_id(1))];
+        state.fail_list = true;
+    }
+    let (spawner, _) = spawner_with(&daemon, true, true);
+    let sessions = spawner.persistent_sessions();
+
+    assert!(matches!(
+        sessions.reattach(session_id(1)),
+        ReattachOutcome::Failed
+    ));
+    daemon.0.lock().fail_list = false;
+    assert!(attached(sessions.reattach(session_id(1))).is_some());
+
+    assert_eq!(daemon.calls(), vec!["list", "list", "attach"]);
+}
+
+#[test]
+fn attach_without_running_daemon_is_not_found() {
+    let daemon = FakeDaemon::default();
+    let (spawner, connections) = spawner_with(&daemon, true, false);
+
+    assert!(matches!(
+        spawner.persistent_sessions().reattach(session_id(1)),
+        ReattachOutcome::NotFound
+    ));
 
     assert_eq!(connections.spawned.load(Ordering::SeqCst), 0);
     assert!(daemon.calls().is_empty());
+}
+
+#[test]
+fn backed_sessions_follow_daemon_liveness() {
+    let daemon = FakeDaemon::default();
+    let (mut spawner, _) = spawner_with(&daemon, true, false);
+    assert!(!spawner.is_persistent_session_backed(session_id(1)));
+
+    spawner
+        .spawn_persistent_session(session_id(1), metadata(), options(), &NoopHooks)
+        .unwrap();
+    assert!(spawner.is_persistent_session_backed(session_id(1)));
+    assert!(!spawner.is_persistent_session_backed(session_id(2)));
+
+    daemon.0.lock().dead = true;
+    assert!(!spawner.is_persistent_session_backed(session_id(1)));
 }
